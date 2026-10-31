@@ -1,0 +1,516 @@
+openapi: 3.1.0
+info:
+  title: Personal AI OS API
+  version: 0.1.0
+  description: Local-first Personal AI OS core API.
+servers:
+  - url: http://localhost:8080
+security:
+  - ApiKeyAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Process is alive
+  /ready:
+    get:
+      security: []
+      summary: Readiness probe
+      responses:
+        '200':
+          description: Database is ready
+        '503':
+          description: Database unavailable
+  /api/v1/goals:
+    post:
+      summary: Create a goal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GoalInput'
+      responses:
+        '201':
+          description: Goal created
+        '400':
+          description: Validation error
+    get:
+      summary: List goals for the local owner
+      responses:
+        '200':
+          description: Goal list
+  /api/v1/goals/{id}:
+    get:
+      summary: Get a goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Goal found
+        '404':
+          description: Goal not found
+    patch:
+      summary: Update editable goal fields
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+                $ref: '#/components/schemas/GoalPatch'
+      responses:
+        '200':
+          description: Goal updated
+        '400':
+          description: Validation error
+  /api/v1/goals/{id}/activate:
+    post:
+      summary: Activate a draft goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Goal activated
+        '409':
+          description: Invalid transition
+  /api/v1/goals/{id}/pause:
+    post:
+      summary: Pause a goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Goal paused
+  /api/v1/goals/{id}/resume:
+    post:
+      summary: Resume a paused goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Goal resumed
+  /api/v1/goals/{id}/complete:
+    post:
+      summary: Complete a goal with verifiable evidence
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [evidence]
+              properties:
+                evidence:
+                  type: array
+                  items:
+                    type: object
+                    required: [source, description]
+                    properties:
+                      source: {type: string}
+                      description: {type: string}
+                      reference: {type: string}
+                      observed_at: {type: string, format: date-time}
+      responses:
+        '200':
+          description: Goal completed
+        '422':
+          description: Evidence required
+  /api/v1/tasks:
+    post:
+      summary: Create a task attached to a goal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskInput'
+      responses:
+        '201':
+          description: Task created
+        '400':
+          description: Validation error
+        '404':
+          description: Goal not found
+    get:
+      summary: List tasks for a goal
+      parameters:
+        - name: goal_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Task list
+  /api/v1/tasks/{id}:
+    get:
+      summary: Get a task
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Task found
+        '404':
+          description: Task not found
+  /api/v1/tasks/{id}/pause:
+    post:
+      summary: Pause a task
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Task paused
+        '409':
+          description: Invalid transition
+  /api/v1/tasks/{id}/resume:
+    post:
+      summary: Resume a paused task
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Task resumed
+  /api/v1/tasks/{id}/retry:
+    post:
+      summary: Mark a failed task ready for a bounded retry
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Task retry scheduled
+        '409':
+          description: Invalid transition or retry budget exhausted
+  /api/v1/tasks/{id}/cancel:
+    post:
+      summary: Cancel a task
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Task cancelled
+  /api/v1/planner/generate:
+    post:
+      summary: Generate a structured mock plan and persist its tasks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [goal_id]
+              properties:
+                goal_id: {type: string, format: uuid}
+      responses:
+        '201':
+          description: Structured plan and created tasks
+        '404':
+          description: Goal not found
+  /api/v1/supervisor/turn:
+    post:
+      summary: Execute a bounded Mock-Agent turn for a goal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [goal_id]
+              properties:
+                goal_id: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Goal, task, execution, and evidence state after the bounded turn
+        '404':
+          description: Goal not found
+        '409':
+          description: No runnable tasks
+        '504':
+          description: Execution budget expired
+  /api/v1/supervisor/status:
+    get:
+      summary: Report local Supervisor readiness and registered agent count
+      responses:
+        '200':
+          description: Supervisor status
+  /api/v1/approvals:
+    post:
+      summary: Request human approval for an exact tool action and parameter set
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, tool_id, action, risk_level]
+              properties:
+                task_id: {type: string, format: uuid}
+                tool_id: {type: string}
+                action: {type: string}
+                parameters: {type: object}
+                risk_level: {type: integer, minimum: 0, maximum: 3}
+                expires_in_seconds: {type: integer, minimum: 1, maximum: 86400, default: 900}
+      responses:
+        '201':
+          description: Approval request created
+    get:
+      summary: List pending approvals
+      responses:
+        '200':
+          description: Pending approvals
+  /api/v1/approvals/{id}:
+    get:
+      summary: Get an approval request
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Approval request
+  /api/v1/approvals/{id}/approve:
+    post:
+      summary: Approve the exact pending action
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Approval granted
+        '409':
+          description: Approval expired or already decided
+  /api/v1/approvals/{id}/reject:
+    post:
+      summary: Reject the pending action
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Approval rejected
+  /api/v1/agents:
+    get:
+      summary: List registered agent profiles
+      responses:
+        '200':
+          description: Agent profiles
+  /api/v1/agents/{id}:
+    get:
+      summary: Get an agent profile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Agent profile
+        '404':
+          description: Agent not found
+  /api/v1/nodes:
+    get:
+      summary: List registered nodes and current health state
+      responses:
+        '200':
+          description: Node list
+  /api/v1/nodes/register:
+    post:
+      summary: Register/update a node identity (registered nodes start offline)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identity, name, type]
+              properties:
+                identity: {type: string}
+                name: {type: string}
+                type: {type: string, enum: [core, worker, vision, robot, home]}
+                capabilities: {type: array, items: {type: string}}
+      responses:
+        '201':
+          description: Node registered offline; a node heartbeat mechanism is not yet exposed
+  /api/v1/nodes/{id}:
+    get:
+      summary: Get a registered node
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Node found
+        '404':
+          description: Node not found
+  /api/v1/memories:
+    post:
+      summary: Create a provenance-aware memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryInput'
+      responses:
+        '201':
+          description: Memory created
+    get:
+      summary: List memories for the local owner
+      responses:
+        '200':
+          description: Memory list
+  /api/v1/memories/{id}:
+    get:
+      summary: Get a memory
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Memory found
+        '404':
+          description: Memory not found
+    patch:
+      summary: Update memory fields
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryPatch'
+      responses:
+        '200':
+          description: Memory updated
+    delete:
+      summary: Soft-delete a memory
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: Memory deleted
+  /api/v1/memories/search:
+    post:
+      summary: Keyword-search memories
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: {type: string}
+      responses:
+        '200':
+          description: Search results
+  /api/v1/knowledge/documents:
+    post:
+      summary: Import and chunk text content
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, source, content]
+              properties:
+                title: {type: string}
+                source: {type: string}
+                content: {type: string}
+                metadata: {type: object}
+      responses:
+        '201':
+          description: Document imported
+        '409':
+          description: Duplicate content
+    get:
+      summary: List imported knowledge documents
+      responses:
+        '200':
+          description: Document list
+  /api/v1/knowledge/search:
+    post:
+      summary: Search knowledge chunks and return citations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: {type: string}
+      responses:
+        '200':
+          description: Cited search results
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    GoalInput:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title: {type: string, minLength: 1}
+        description: {type: string}
+        parent_goal_id: {type: [string, 'null'], format: uuid}
+        priority: {type: integer, minimum: 1, maximum: 5, default: 3}
+        success_criteria: {type: array, items: {type: string}}
+        constraints: {type: array, items: {type: string}}
+    GoalPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title: {type: string, minLength: 1}
+        description: {type: string}
+        priority: {type: integer, minimum: 1, maximum: 5}
+        success_criteria: {type: array, items: {type: string}}
+        constraints: {type: array, items: {type: string}}
+    TaskInput:
+      type: object
+      additionalProperties: false
+      required: [goal_id, title]
+      properties:
+        goal_id: {type: string, format: uuid}
+        title: {type: string, minLength: 1}
+        description: {type: string}
+        priority: {type: integer, minimum: 1, maximum: 5, default: 3}
+        success_criteria: {type: array, items: {type: string}}
+    MemoryInput:
+      type: object
+      additionalProperties: false
+      required: [category, content, source]
+      properties:
+        category: {type: string, enum: [fact, preference, experience, relationship, event, instruction]}
+        content: {type: string, minLength: 1}
+        source: {type: string, minLength: 1}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        observed_at: {type: string, format: date-time}
+        metadata: {type: object}
+    MemoryPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        category: {type: string, enum: [fact, preference, experience, relationship, event, instruction]}
+        content: {type: string, minLength: 1}
+        source: {type: string, minLength: 1}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        observed_at: {type: string, format: date-time}
+        metadata: {type: object}

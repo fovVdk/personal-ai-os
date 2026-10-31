@@ -1,0 +1,18 @@
+# Local secrets and runtime configuration
+.env
+.env.*.local
+
+# Persistent local data (including PostgreSQL and Ollama volumes)
+data/
+
+# Build outputs
+bin/
+build/
+*.test
+*.out
+coverage/
+
+# macOS/editor metadata
+.DS_Store
+.vscode/
+.idea/

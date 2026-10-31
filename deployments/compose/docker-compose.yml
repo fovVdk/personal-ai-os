@@ -1,0 +1,39 @@
+services:
+  postgres:
+    # PostgreSQL 16 image with pgvector extension; host port is loopback-only.
+    # PostgreSQL 16 并包含 pgvector 扩展；宿主机端口仅绑定回环地址。
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: paios
+      POSTGRES_USER: paios
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ${PAIOS_DATA_DIR:-../../data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paios -d paios"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  ollama:
+    # Optional local model runtime; opt in with the ollama Compose profile.
+    # 可选本地模型运行时；通过 ollama Compose profile 显式启用。
+    image: ollama/ollama:0.12.6
+    profiles: ["ollama"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ${OLLAMA_DATA_DIR:-../../data/ollama}:/root/.ollama
+    deploy:
+      resources:
+        limits:
+          memory: 8G

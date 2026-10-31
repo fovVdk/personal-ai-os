@@ -1,0 +1,39 @@
+# Reference template only; the runtime currently reads environment variables.
+# 仅供参考的配置模板；程序当前从环境变量读取运行配置。
+app:
+  environment: development
+  host: 127.0.0.1
+  port: "8080"
+  log_level: info
+
+database:
+  url: postgres://paios:${POSTGRES_PASSWORD}@localhost:5432/paios?sslmode=disable
+
+security:
+  # Set PAIOS_API_KEY through the environment; never commit a real key.
+  # 通过环境变量设置 PAIOS_API_KEY；切勿将真实密钥提交到仓库。
+  api_key_env: PAIOS_API_KEY
+
+model:
+  # Supported providers: mock, openai-compatible, ollama.
+  # 支持的 Provider：mock、openai-compatible、ollama。
+  provider: mock
+  base_url: ""
+  api_key_env: MODEL_API_KEY
+  name: mock
+  ollama_base_url: http://localhost:11434
+
+storage:
+  # These paths are currently configuration placeholders; file storage is not wired yet.
+  # 这些路径目前仅作为配置占位；文件存储流程尚未接入。
+  data_dir: ./data
+  file_storage_dir: ./data/files
+
+execution:
+  max_agent_steps: 12
+  max_model_calls: 8
+  max_model_tokens: 64000
+  max_tool_calls: 20
+  max_execution_seconds: 300
+  max_execution_cost: 0
+  max_retries: 3
