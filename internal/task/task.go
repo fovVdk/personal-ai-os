@@ -40,6 +40,7 @@ type Task struct {
 	Status          Status     `json:"status"`
 	AttemptCount    int        `json:"attempt_count"`
 	PlanKey         string     `json:"plan_key,omitempty"`
+	CriterionIDs    []string   `json:"criterion_ids,omitempty"`
 	SuccessCriteria []string   `json:"success_criteria"`
 	DependsOn       []string   `json:"depends_on,omitempty"`
 	ScheduledAt     *time.Time `json:"scheduled_at,omitempty"`

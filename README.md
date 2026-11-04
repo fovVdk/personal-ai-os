@@ -59,7 +59,7 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 
 ## PostgreSQL 数据设计 | Persistence
 
-迁移文件按 `0001`–`0010` 顺序嵌入二进制，应用时使用 PostgreSQL advisory lock、事务及迁移内容校验和。迁移只向前演进，不应手工删除版本记录或在生产库上试验。
+迁移文件按 `0001`–`0016` 顺序嵌入二进制，应用时使用 PostgreSQL advisory lock、事务及迁移内容校验和。迁移只向前演进，不应手工删除版本记录或在生产库上试验。
 
 | Migration | 主要对象 |
 | --- | --- |
@@ -73,6 +73,12 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | `0008_durable_execution_runtime.sql` | Durable Execution 的 Lease/Fencing、Checkpoint、Run/Step 幂等和状态历史 |
 | `0009_tool_fabric.sql` | `tool_invocations` 持久记录及审批 Tool Version/Execution/Step/Agent/一次性消费绑定 |
 | `0010_goal_tool_usage.sql` | 扩展 Goal 用量账本，持久化 Core 观察到的 Tool Call 数量用于跨轮预算 |
+| `0011_goal_evaluations.sql` | 持久化 Goal Evaluator 快照历史及查询索引 |
+| `0012_structured_goal_criteria.sql` | 为 Goal 增加结构化、版本化的 Success Criteria JSONB 和 GIN 索引 |
+| `0013_autonomy_records.sql` | Task PlanKey/Criteria mapping、Criterion Verification/Evidence links、Plan Version/Proposal、Supervisor Decision 历史 |
+| `0014_goal_jobs.sql` | Goal Job 持久状态、Lease/Fencing/Heartbeat、运行/重试预算 |
+| `0015_outbox_dispatch_leases.sql` | Outbox Dispatcher Lease/重试/死信及 Goal Job 幂等唤醒回执 |
+| `0016_source_snapshots.sql` | 不可变来源原始/规范化快照及报告引用绑定 |
 
 主键使用 UUID，业务时间使用 `timestamptz`，可扩展字段使用 JSONB。Goal/Task 创建、修改和转换以及审批决策通过事务写入相关审计/Outbox 记录。Knowledge 和 Memory 当前使用 PostgreSQL 全文检索，不是向量检索。
 
@@ -85,8 +91,13 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | GET | `/health`, `/ready` | 存活及数据库就绪探针（无需 Key） |
 | POST/GET | `/api/v1/goals` | 创建/列出 Goal |
 | GET/PATCH | `/api/v1/goals/{id}` | 读取/修改 Goal |
-| POST | `/api/v1/goals/{id}/activate`, `/pause`, `/resume`, `/complete` | Goal 状态操作；完成需 Evidence |
-| POST/GET | `/api/v1/tasks` | 创建/按 Goal 列出 Task |
+| POST | `/api/v1/goals/{id}/activate`, `/pause`, `/resume`, `/complete` | Goal 状态操作；完成需当前版本评估满足全部 required typed criteria，最终 Evidence 由评估派生 |
+| POST/GET | `/api/v1/goals/{id}/evaluate`, `/evaluations` | 保存/查询基于持久化事实的 Goal Evaluation；不自动完成 Goal |
+| GET | `/api/v1/goals/{id}/decisions` | 查询持久化 Supervisor Decision 历史 |
+| GET | `/api/v1/goals/{id}/plan`, `/plan/proposals` | 查询当前 Plan Version 和提案历史 |
+| POST | `/api/v1/goals/{id}/replan` | 基于当前 Evaluation 生成并持久化 Plan Proposal（不自动提交） |
+| POST | `/api/v1/goals/{id}/plan-proposals/{proposalID}/accept`, `/reject` | Core 校验后原子提交或审计拒绝 Plan Proposal |
+| POST/GET | `/api/v1/tasks` | 创建/按 Goal 列出 Task；创建时 `criterion_ids` 只能引用该 Goal 已定义的成功标准 |
 | GET | `/api/v1/tasks/{id}` | 读取 Task |
 | POST | `/api/v1/tasks/{id}/pause`, `/resume`, `/retry`, `/cancel` | Task 状态操作 |
 | POST | `/api/v1/planner/generate` | 生成并持久化结构化计划及任务 |
@@ -105,6 +116,8 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | POST | `/api/v1/memories/search` | 关键词全文搜索 |
 | POST/GET | `/api/v1/knowledge/documents` | 导入文本/列出文档 |
 | POST | `/api/v1/knowledge/search` | 全文检索并返回引用 |
+| GET | `/api/v1/goals/{id}/sources`, `/api/v1/goals/{id}/sources/{sourceID}` | 查询来源快照及规范化文本 |
+| POST/GET | `/api/v1/goals/{id}/source-references` | 绑定/查询报告引用；Core 校验 URL、快照和精确摘录，语义支持仍需独立审阅 |
 | GET | `/api/v1/nodes`, `/api/v1/nodes/{id}` | 列出/读取节点 |
 | POST | `/api/v1/nodes/register` | 注册节点 |
 
@@ -124,7 +137,7 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL_NAME` | OpenAI-compatible Provider 配置；Secret 只从环境变量读取 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` |
 | `DATA_DIR`, `FILE_STORAGE_DIR` | Native `filesystem.read/list` 的授权目录是 `FILE_STORAGE_DIR`；仅当目录已存在时才注册 |
-| `HTTP_FETCH_ALLOWED_HOSTS` | 逗号分隔的精确主机白名单；未配置时不注册 `http.fetch`。仅 HTTP(S)/公有解析地址、无重定向、响应限 1 MiB |
+| `HTTP_FETCH_ALLOWED_HOSTS` | 逗号分隔的精确主机白名单；未配置时不注册 `http.fetch`/`source.capture`。快照采集仅 HTTP(S)，每跳重新校验白名单，DNS 解析后仅直连公有地址，最多 5 次重定向、15 秒整体超时、2 MiB 响应上限，并校验 MIME |
 | `MCP_SERVERS_JSON` | 操作员提供的严格 JSON Server 配置数组；留空时不启动 MCP Server。HTTP 需 HTTPS/精确 host allowlist；stdio 需绝对命令、独立 argv、工作目录和显式环境 |
 | `MAX_AGENT_STEPS`, `MAX_MODEL_CALLS`, `MAX_MODEL_TOKENS`, `MAX_TOOL_CALLS` | Supervisor 单次 Goal turn 预算 |
 | `MAX_EXECUTION_SECONDS`, `MAX_EXECUTION_COST`, `MAX_RETRIES` | 执行时间、成本和重试预算 |
@@ -171,9 +184,15 @@ Mock 配置返回确定性结构化计划；配置真实 Provider 时 Planner �
 
 测试覆盖 Goal/Task 状态转换、Evidence 门控、A0–A3 Policy、审批哈希和过期、Tool Registry/Gateway、Native filesystem/SSRF 边界、模型 Tool Call 往返/Approval Checkpoint 精确续行/输出不写入 checkpoint、预算校验、配置校验、计划 DAG、Provider/Tool-call Schema、Knowledge 分块等。MCP 测试使用官方 SDK Client + 真实 Streamable HTTP Server 和真实 stdio 子进程 Server，覆盖发现、Schema 变更、审批、重放、错误、超时、主动取消、进程崩溃及自动恢复。PostgreSQL 集成测试覆盖 MCP Gateway 审批、Invocation/Audit/Outbox、恢复以及 Goal Tool Call 累计预算账本。
 
-已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...` 和 fresh isolated PostgreSQL 16/pgvector 的 `make test-integration`。Phase 11 MCP 已使用真实官方 SDK Client/Server 验证本地 Streamable HTTP；MCP 工具通过 Gateway Policy/Approval，并在真实 PostgreSQL 中完成 Invocation、Audit/Outbox 与结果重放验收。Phase 10 的 Mock Agent 仍输出未经独立验证的结果，因此 Worker 不会伪称真实任务已完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)、[docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)、[docs/PHASE10_IMPLEMENTATION_REPORT.md](docs/PHASE10_IMPLEMENTATION_REPORT.md)、[docs/PHASE11_DESIGN.md](docs/PHASE11_DESIGN.md)、[docs/PHASE11_IMPLEMENTATION_REPORT.md](docs/PHASE11_IMPLEMENTATION_REPORT.md)、[docs/PHASE11_MCP_DESIGN.md](docs/PHASE11_MCP_DESIGN.md)、[docs/PHASE11_MCP_IMPLEMENTATION_REPORT.md](docs/PHASE11_MCP_IMPLEMENTATION_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
+Phase 12.3 本地验收中，`make fmt`、`make test`、`make build`、`make vet` 和真实 PostgreSQL `make test-integration` 已在新增 Goal Job、Outbox Lease/重试/死信、Source Snapshot/Reference tests 后运行通过。还需最终复跑 `go test -race ./...`、`make build-arm64` 和 Compose/OpenAPI YAML parse。Hosted CI 的 Go 1.25 结果仍以 CI 页面为准；本机使用 Go 1.27.3。完整 Autonomous Goal E2E 仍 NOT VERIFIED。报告见 [docs/AUTONOMOUS_RUNTIME_REPORT.md](docs/AUTONOMOUS_RUNTIME_REPORT.md)、[docs/EVENT_DRIVEN_RUNTIME_REPORT.md](docs/EVENT_DRIVEN_RUNTIME_REPORT.md)、[docs/SOURCE_SNAPSHOT_REPORT.md](docs/SOURCE_SNAPSHOT_REPORT.md) 和 [docs/AUTONOMOUS_GOAL_E2E_REPORT.md](docs/AUTONOMOUS_GOAL_E2E_REPORT.md)。
 
-主要尚未实现或不完整的能力：Supervisor 基于 Evidence 的动态进度评估/重规划、独立 Agent 结果验证、多 Agent 协作、MCP OAuth/HTTP 凭据、安全凭据仓储、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API。ModelAgent 已可围绕单个 Task 进行有界 Tool Call 往返和审批 checkpoint 恢复，但最终回答仍为未验证，不能完成 Task/Goal。MCP Server 配置来自受控的 `MCP_SERVERS_JSON`，不允许 API 或 Agent 任意注册命令。Filesystem 路径防护使用配置根目录与符号链接解析；根目录应由可信管理员维护，避免其他本地进程并发改写目录结构。Tool 外部副作用结果未知时不会自动重放；这不代表任意外部 API exactly-once。
+当前结构化 criteria 支持 verified evidence/task 规则，以及 FILE_STORAGE_DIR 下 artifact existence、Markdown 必需标题和可选 Source Reference 结构校验；验证写入带 Criterion 版本、Evidence UUID、Verifier 版本和 SHA-256。完成门禁复核当前 Artifact Hash，并可核验来源快照完整性、时效、URL 绑定、精确摘录和报告可见引用。它不判断报告语义或来源是否权威，不能将 lexical match 当作真实性证明。ModelAgent 的最终文本仍不可信；只有 Core 注入的确定性 verifier 结果可支持已实现的检查。Goal Job 与事件唤醒现在已持久化；仍缺多 Agent、MCP OAuth/凭据仓库、Memory/Knowledge Embedding 检索、RBAC/API Token、通用外部 Outbox 发布、Audit retention/query、OpenTelemetry 和 Node heartbeat API。Tool 外部副作用状态为 unknown 时不会自动重放，也不承诺任意外部 API exactly-once。
+
+Phase 12.2.3–12.2.5 已有部分可用的持久化基础：Migration 0013 保存 Criterion Verification、Task criterion mapping、Plan Version/Proposal 和 Supervisor Decision；Evaluator 将建议映射到可查询、幂等的 Decision；初始计划通过 Proposal→Core commit 创建；Supervisor 对失败/阻塞或可补充的标准差距生成有界 replanning proposal。提交会检查 DAG、Criteria mapping、任务预算、Plan Base Version，并保留已完成 Task；运行/等待中的 Task 必须继续保留，不支持静默移除；无新增 Task 的 replan 被拒绝。Decision 与 Evidence/Audit/Outbox 可恢复，Goal 锁协调 Task/Evidence 写入与完成门禁。
+
+本阶段仍不是完整的端到端自主执行闭环：没有生产报告 writer/经独立验证的 Research Agent，无法证明来源对报告语义陈述的支持，也未完成同时包含真实外部抓取、审批恢复、unknown 外部效果、Worker 崩溃、Core 重启和最终 Goal 完成的单一全链路验收。测试使用真实 PostgreSQL 验证各子系统，但不将其描述为真实研究成功。具体限制见 Phase 12.3 reports。
+
+更详细的边界与事务说明见 [Verification Design](docs/VERIFICATION_DESIGN.md)、[Dynamic Planning Design](docs/DYNAMIC_PLANNING_DESIGN.md) 和 [Supervisor Design](docs/SUPERVISOR_DESIGN.md)。
 
 ## 依赖边界与变更原则 | Contribution boundaries
 

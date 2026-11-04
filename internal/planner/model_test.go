@@ -6,9 +6,11 @@ package planner
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
+	"personal-ai-os/internal/goal"
 	"personal-ai-os/internal/model/gateway"
 )
 
@@ -34,12 +36,16 @@ func TestModelGeneratorValidatesStructuredOutput(t *testing.T) {
 	payload, _ := json.Marshal(valid)
 	gatewayMock := &fixedGateway{response: string(payload)}
 	generator := ModelGenerator{Gateway: gatewayMock, Model: "mock", Timeout: time.Second}
-	plan, err := generator.GenerateContext(context.Background(), GoalInput{ID: "goal-1", Title: "Goal"})
+	criterion := goal.SuccessCriterion{ID: "sources", Name: "Cited sources", Type: goal.CriterionVerifiedEvidenceCount, Required: true, ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence, MinEvidence: 2, Source: goal.CriterionSourceUser, Confirmed: true, Version: 1}
+	plan, err := generator.GenerateContext(context.Background(), GoalInput{ID: "goal-1", Title: "Goal", Criteria: []goal.SuccessCriterion{criterion}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan.GoalID != "goal-1" || gatewayMock.seen.MaxTokens != 4000 {
 		t.Fatalf("plan=%+v request=%+v", plan, gatewayMock.seen)
+	}
+	if len(gatewayMock.seen.Messages) != 2 || !strings.Contains(gatewayMock.seen.Messages[1].Content, `"criteria":[{"id":"sources"`) {
+		t.Fatalf("Planner request omitted structured Goal criteria: %+v", gatewayMock.seen.Messages)
 	}
 	gatewayMock.response = `{"goal_id":"other","summary":"bad","tasks":[{"key":"x","title":"x"}],"unexpected":true}`
 	if _, err := generator.GenerateContext(context.Background(), GoalInput{ID: "goal-1", Title: "Goal"}); err == nil {

@@ -10,16 +10,20 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"personal-ai-os/internal/goal"
 )
 
 type TaskSpec struct {
-	Key             string   `json:"key"`
-	Title           string   `json:"title"`
-	Description     string   `json:"description"`
-	SuccessCriteria []string `json:"success_criteria"`
-	DependsOn       []string `json:"depends_on"`
-	EstimatedHours  float64  `json:"estimated_hours"`
-	Risks           []string `json:"risks"`
+	Key                  string   `json:"key"`
+	Title                string   `json:"title"`
+	Description          string   `json:"description"`
+	SuccessCriteria      []string `json:"success_criteria"`
+	CriterionIDs         []string `json:"criterion_ids,omitempty"`
+	EvidenceRequirements []string `json:"evidence_requirements,omitempty"`
+	DependsOn            []string `json:"depends_on"`
+	EstimatedHours       float64  `json:"estimated_hours"`
+	Risks                []string `json:"risks"`
 }
 
 type Plan struct {
@@ -39,11 +43,26 @@ type Generator interface {
 }
 
 type GoalInput struct {
-	ID              string
-	Title           string
-	Description     string
-	SuccessCriteria []string
-	Constraints     []string
+	ID              string                  `json:"id"`
+	Title           string                  `json:"title"`
+	Description     string                  `json:"description"`
+	SuccessCriteria []string                `json:"success_criteria,omitempty"`
+	Criteria        []goal.SuccessCriterion `json:"criteria,omitempty"`
+	Constraints     []string                `json:"constraints,omitempty"`
+	UnmetCriteria   []string                `json:"unmet_criteria,omitempty"`
+	FailedTasks     []string                `json:"failed_tasks,omitempty"`
+	BlockedTasks    []string                `json:"blocked_tasks,omitempty"`
+	ExistingTasks   []ExistingTask          `json:"existing_tasks,omitempty"`
+}
+
+type ExistingTask struct {
+	Key             string   `json:"key"`
+	Status          string   `json:"status"`
+	Title           string   `json:"title"`
+	Description     string   `json:"description"`
+	SuccessCriteria []string `json:"success_criteria,omitempty"`
+	CriterionIDs    []string `json:"criterion_ids,omitempty"`
+	DependsOn       []string `json:"depends_on,omitempty"`
 }
 
 func (p Plan) Validate() error {
@@ -69,6 +88,13 @@ func (p Plan) Validate() error {
 		}
 		if task.EstimatedHours < 0 || math.IsNaN(task.EstimatedHours) || math.IsInf(task.EstimatedHours, 0) {
 			return fmt.Errorf("task %q estimate must be finite and non-negative", task.Key)
+		}
+		seenCriteria := make(map[string]bool, len(task.CriterionIDs))
+		for _, criterionID := range task.CriterionIDs {
+			if strings.TrimSpace(criterionID) == "" || seenCriteria[criterionID] {
+				return fmt.Errorf("task %q has an empty or duplicate criterion mapping", task.Key)
+			}
+			seenCriteria[criterionID] = true
 		}
 		keys[task.Key] = task
 	}

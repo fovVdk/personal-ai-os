@@ -29,6 +29,7 @@ import (
 	"personal-ai-os/internal/model/gateway"
 	"personal-ai-os/internal/node"
 	"personal-ai-os/internal/planner"
+	"personal-ai-os/internal/source"
 	"personal-ai-os/internal/supervisor"
 	"personal-ai-os/internal/task"
 	toolmcp "personal-ai-os/internal/tool/mcp"
@@ -54,6 +55,7 @@ type Server struct {
 	Memories  memory.Repository
 	Nodes     node.Repository
 	Knowledge knowledge.Repository
+	Sources   source.Repository
 	Planner   planner.Generator
 	Models    gateway.Gateway
 	Approvals approval.Repository
@@ -63,6 +65,7 @@ type Server struct {
 	// 中文：MCPServers 仅提供本地 Server 状态/生命周期，不暴露 SDK Session 或凭据。
 	MCPServers        *toolmcp.Manager
 	Supervisor        *supervisor.Supervisor
+	GoalJobs          supervisor.GoalJobRepository
 	WorkerStatus      func() any
 	DurableExecutions durableExecutionAPI
 	DB                readiness
@@ -91,6 +94,20 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/goals/{id}/pause", s.transitionGoal(goal.Paused))
 		r.Post("/goals/{id}/resume", s.transitionGoal(goal.Active))
 		r.Post("/goals/{id}/complete", s.transitionGoal(goal.Completed))
+		r.Post("/goals/{id}/evaluate", s.evaluateGoal)
+		r.Get("/goals/{id}/evaluations", s.listGoalEvaluations)
+		r.Get("/goals/{id}/decisions", s.listGoalDecisions)
+		r.Get("/goals/{id}/plan", s.getCurrentPlan)
+		r.Get("/goals/{id}/plan/proposals", s.listPlanProposals)
+		r.Post("/goals/{id}/replan", s.proposeGoalPlan)
+		r.Post("/goals/{id}/plan-proposals/{proposalID}/accept", s.acceptGoalPlanProposal)
+		r.Post("/goals/{id}/plan-proposals/{proposalID}/reject", s.rejectGoalPlanProposal)
+		r.Post("/goals/{id}/jobs", s.createOrWakeGoalJob)
+		r.Get("/goals/{id}/jobs", s.listGoalJobs)
+		r.Get("/goals/{id}/sources", s.listSourceSnapshots)
+		r.Get("/goals/{id}/sources/{sourceID}", s.getSourceSnapshot)
+		r.Post("/goals/{id}/source-references", s.createSourceReference)
+		r.Get("/goals/{id}/source-references", s.listSourceReferences)
 		r.Post("/tasks", s.createTask)
 		r.Get("/tasks", s.listTasks)
 		r.Get("/tasks/{id}", s.getTask)
@@ -102,6 +119,10 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/supervisor/turn", s.supervisorTurn)
 		r.Get("/supervisor/status", s.supervisorStatus)
 		r.Get("/executions/{id}", s.getExecution)
+		r.Get("/goal-jobs/{jobID}", s.getGoalJob)
+		r.Post("/goal-jobs/{jobID}/pause", s.pauseGoalJob)
+		r.Post("/goal-jobs/{jobID}/resume", s.resumeGoalJob)
+		r.Post("/goal-jobs/{jobID}/cancel", s.cancelGoalJob)
 		r.Post("/executions/{id}/cancel", s.cancelExecution)
 		r.Get("/agents", s.listAgents)
 		r.Get("/agents/{id}", s.getAgent)
@@ -232,12 +253,13 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 type createGoalRequest struct {
-	Title           string   `json:"title"`
-	Description     string   `json:"description"`
-	ParentGoalID    *string  `json:"parent_goal_id"`
-	Priority        int      `json:"priority"`
-	SuccessCriteria []string `json:"success_criteria"`
-	Constraints     []string `json:"constraints"`
+	Title           string                  `json:"title"`
+	Description     string                  `json:"description"`
+	ParentGoalID    *string                 `json:"parent_goal_id"`
+	Priority        int                     `json:"priority"`
+	SuccessCriteria []string                `json:"success_criteria"`
+	Criteria        []goal.SuccessCriterion `json:"criteria"`
+	Constraints     []string                `json:"constraints"`
 }
 
 func (s *Server) createGoal(w http.ResponseWriter, r *http.Request) {
@@ -245,11 +267,15 @@ func (s *Server) createGoal(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	if len(input.Criteria) > 0 && len(input.SuccessCriteria) > 0 {
+		writeError(w, r, http.StatusBadRequest, "invalid_goal", "use structured criteria instead of combining criteria with legacy success_criteria")
+		return
+	}
 	if input.Priority == 0 {
 		input.Priority = 3
 	}
 	item := goal.Goal{Title: input.Title, Description: input.Description, OwnerID: defaultOwnerID, ParentGoalID: input.ParentGoalID, Priority: input.Priority,
-		SuccessCriteria: input.SuccessCriteria, Constraints: input.Constraints, AutonomyPolicy: map[string]any{}, ReviewPolicy: map[string]any{}, Status: goal.Draft}
+		SuccessCriteria: input.SuccessCriteria, Criteria: confirmUserCriteria(input.Criteria), Constraints: input.Constraints, AutonomyPolicy: map[string]any{}, ReviewPolicy: map[string]any{}, Status: goal.Draft}
 	if err := item.Validate(); err != nil {
 		writeError(w, r, http.StatusBadRequest, "invalid_goal", err.Error())
 		return
@@ -285,11 +311,12 @@ func (s *Server) getGoal(w http.ResponseWriter, r *http.Request) {
 }
 
 type goalPatch struct {
-	Title           *string   `json:"title"`
-	Description     *string   `json:"description"`
-	Priority        *int      `json:"priority"`
-	SuccessCriteria *[]string `json:"success_criteria"`
-	Constraints     *[]string `json:"constraints"`
+	Title           *string                  `json:"title"`
+	Description     *string                  `json:"description"`
+	Priority        *int                     `json:"priority"`
+	SuccessCriteria *[]string                `json:"success_criteria"`
+	Criteria        *[]goal.SuccessCriterion `json:"criteria"`
+	Constraints     *[]string                `json:"constraints"`
 }
 
 func (s *Server) updateGoal(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +333,10 @@ func (s *Server) updateGoal(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &patch) {
 		return
 	}
+	if patch.Criteria != nil && patch.SuccessCriteria != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid_goal", "do not combine criteria and legacy success_criteria in one update")
+		return
+	}
 	if patch.Title != nil {
 		item.Title = *patch.Title
 	}
@@ -317,6 +348,10 @@ func (s *Server) updateGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.SuccessCriteria != nil {
 		item.SuccessCriteria = *patch.SuccessCriteria
+	}
+	if patch.Criteria != nil {
+		item.Criteria = reviseUserCriteria(*patch.Criteria, item.Criteria)
+		item.SuccessCriteria = nil
 	}
 	if patch.Constraints != nil {
 		item.Constraints = *patch.Constraints
@@ -333,6 +368,36 @@ func (s *Server) updateGoal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
+func confirmUserCriteria(criteria []goal.SuccessCriterion) []goal.SuccessCriterion {
+	confirmed := append([]goal.SuccessCriterion(nil), criteria...)
+	for i := range confirmed {
+		confirmed[i].Source = goal.CriterionSourceUser
+		confirmed[i].Confirmed = true
+		confirmed[i].Version = 1
+		if confirmed[i].CreatedAt.IsZero() {
+			confirmed[i].CreatedAt = time.Now().UTC()
+		}
+	}
+	return confirmed
+}
+
+func reviseUserCriteria(criteria, previous []goal.SuccessCriterion) []goal.SuccessCriterion {
+	previousByID := make(map[string]goal.SuccessCriterion, len(previous))
+	for _, item := range previous {
+		previousByID[item.ID] = item
+	}
+	updated := confirmUserCriteria(criteria)
+	for i := range updated {
+		if prior, ok := previousByID[updated[i].ID]; ok {
+			updated[i].Version = prior.Version + 1
+			if !prior.CreatedAt.IsZero() {
+				updated[i].CreatedAt = prior.CreatedAt
+			}
+		}
+	}
+	return updated
+}
+
 func (s *Server) transitionGoal(next goal.Status) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var evidence []goal.Evidence
@@ -344,6 +409,27 @@ func (s *Server) transitionGoal(next goal.Status) http.HandlerFunc {
 				return
 			}
 			evidence = input.Evidence
+			if len(evidence) == 0 {
+				writeError(w, r, http.StatusUnprocessableEntity, "evidence_required", "goal completion requires evidence")
+				return
+			}
+			if s.Supervisor == nil {
+				writeError(w, r, http.StatusConflict, "criteria_unverified", "goal completion requires a configured evaluator and satisfied structured success criteria")
+				return
+			}
+			evaluation, err := s.Supervisor.EvaluateGoal(r.Context(), chi.URLParam(r, "id"))
+			if errors.Is(err, paierrors.ErrNotFound) {
+				writeError(w, r, http.StatusNotFound, "not_found", "goal not found")
+				return
+			}
+			if err != nil {
+				s.internalError(w, r, "verify goal criteria", err)
+				return
+			}
+			if evaluation.RecommendedAction != supervisor.ActionVerifyCompletion {
+				writeError(w, r, http.StatusUnprocessableEntity, "criteria_unverified", "required structured success criteria are not satisfied by current verified evidence")
+				return
+			}
 		}
 		item, err := s.Goals.Transition(r.Context(), defaultOwnerID, chi.URLParam(r, "id"), next, evidence)
 		if errors.Is(err, paierrors.ErrNotFound) {
@@ -352,6 +438,10 @@ func (s *Server) transitionGoal(next goal.Status) http.HandlerFunc {
 		}
 		if errors.Is(err, goal.ErrEvidenceRequired) {
 			writeError(w, r, http.StatusUnprocessableEntity, "evidence_required", err.Error())
+			return
+		}
+		if errors.Is(err, goal.ErrCriteriaUnverified) {
+			writeError(w, r, http.StatusUnprocessableEntity, "criteria_unverified", err.Error())
 			return
 		}
 		if errors.Is(err, goal.ErrInvalidTransition) {
@@ -372,6 +462,7 @@ type createTaskRequest struct {
 	Description     string   `json:"description"`
 	Priority        int      `json:"priority"`
 	SuccessCriteria []string `json:"success_criteria"`
+	CriterionIDs    []string `json:"criterion_ids,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -382,14 +473,27 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if input.Priority == 0 {
 		input.Priority = 3
 	}
-	if _, err := s.Goals.Get(r.Context(), defaultOwnerID, input.GoalID); errors.Is(err, paierrors.ErrNotFound) {
+	goalItem, err := s.Goals.Get(r.Context(), defaultOwnerID, input.GoalID)
+	if errors.Is(err, paierrors.ErrNotFound) {
 		writeError(w, r, http.StatusNotFound, "goal_not_found", "goal not found")
 		return
 	} else if err != nil {
 		s.internalError(w, r, "verify task goal", err)
 		return
 	}
-	item := task.Task{GoalID: input.GoalID, Title: input.Title, Description: input.Description, Priority: input.Priority, Status: task.Created, SuccessCriteria: input.SuccessCriteria}
+	allowedCriteria := make(map[string]bool, len(goalItem.Criteria))
+	for _, criterion := range goalItem.Criteria {
+		allowedCriteria[criterion.ID] = true
+	}
+	seenCriteria := make(map[string]bool, len(input.CriterionIDs))
+	for _, criterionID := range input.CriterionIDs {
+		if !allowedCriteria[criterionID] || seenCriteria[criterionID] {
+			writeError(w, r, http.StatusBadRequest, "invalid_task", "task criterion_ids must be unique IDs defined on its Goal")
+			return
+		}
+		seenCriteria[criterionID] = true
+	}
+	item := task.Task{GoalID: input.GoalID, Title: input.Title, Description: input.Description, Priority: input.Priority, Status: task.Created, SuccessCriteria: input.SuccessCriteria, CriterionIDs: input.CriterionIDs}
 	if err := item.Validate(); err != nil {
 		writeError(w, r, http.StatusBadRequest, "invalid_task", err.Error())
 		return

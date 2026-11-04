@@ -21,11 +21,25 @@ const LocalOwnerID = "00000000-0000-4000-8000-000000000001"
 
 // Postgres implements the core Goal and Task repositories.
 // 中文：Postgres 实现核心 Goal 与 Task 仓储。
-type Postgres struct{ pool *pgxpool.Pool }
+type ArtifactFreshnessVerifier interface {
+	VerifyArtifactHash(context.Context, string, string) error
+}
+
+type Postgres struct {
+	pool             *pgxpool.Pool
+	artifactVerifier ArtifactFreshnessVerifier
+}
 
 func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 
+func (p *Postgres) SetArtifactFreshnessVerifier(verifier ArtifactFreshnessVerifier) {
+	p.artifactVerifier = verifier
+}
+
 func (p *Postgres) Create(ctx context.Context, item goal.Goal) (goal.Goal, error) {
+	if err := goal.ValidateSuccessCriteria(item.Criteria); err != nil {
+		return goal.Goal{}, fmt.Errorf("validate structured goal criteria: %w", err)
+	}
 	criteria, err := json.Marshal(item.SuccessCriteria)
 	if err != nil {
 		return goal.Goal{}, fmt.Errorf("encode goal criteria: %w", err)
@@ -44,6 +58,13 @@ func (p *Postgres) Create(ctx context.Context, item goal.Goal) (goal.Goal, error
 	}
 	if item.SuccessCriteria == nil {
 		criteria = []byte("[]")
+	}
+	structuredCriteria, err := json.Marshal(item.Criteria)
+	if err != nil {
+		return goal.Goal{}, fmt.Errorf("encode structured goal criteria: %w", err)
+	}
+	if item.Criteria == nil {
+		structuredCriteria = []byte("[]")
 	}
 	if item.Constraints == nil {
 		constraints = []byte("[]")
@@ -65,10 +86,10 @@ func (p *Postgres) Create(ctx context.Context, item goal.Goal) (goal.Goal, error
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	row := tx.QueryRow(ctx, `INSERT INTO goals
-		(owner_id,parent_goal_id,title,description,priority,success_criteria,constraints,autonomy_policy,review_policy,status,progress)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		(owner_id,parent_goal_id,title,description,priority,success_criteria,structured_success_criteria,constraints,autonomy_policy,review_policy,status,progress)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		RETURNING id::text,created_at,updated_at`, item.OwnerID, parentID, item.Title, item.Description,
-		item.Priority, criteria, constraints, autonomy, review, item.Status, item.Progress)
+		item.Priority, criteria, structuredCriteria, constraints, autonomy, review, item.Status, item.Progress)
 	if err := row.Scan(&item.ID, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return goal.Goal{}, fmt.Errorf("insert goal: %w", err)
 	}
@@ -85,10 +106,10 @@ func (p *Postgres) Get(ctx context.Context, ownerID, id string) (goal.Goal, erro
 	var item goal.Goal
 	var parentID *string
 	err := p.pool.QueryRow(ctx, `SELECT id::text,title,description,owner_id::text,parent_goal_id::text,priority,
-		success_criteria,constraints,autonomy_policy,review_policy,status,progress,created_at,updated_at,completed_at
+		success_criteria,structured_success_criteria,constraints,autonomy_policy,review_policy,status,progress,created_at,updated_at,completed_at
 		FROM goals WHERE owner_id=$1 AND id=$2`, ownerID, id).Scan(
 		&item.ID, &item.Title, &item.Description, &item.OwnerID, &parentID, &item.Priority,
-		&item.SuccessCriteria, &item.Constraints, &item.AutonomyPolicy, &item.ReviewPolicy, &item.Status, &item.Progress,
+		&item.SuccessCriteria, &item.Criteria, &item.Constraints, &item.AutonomyPolicy, &item.ReviewPolicy, &item.Status, &item.Progress,
 		&item.CreatedAt, &item.UpdatedAt, &item.CompletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return goal.Goal{}, ErrNotFound
@@ -106,7 +127,7 @@ func (p *Postgres) Get(ctx context.Context, ownerID, id string) (goal.Goal, erro
 
 func (p *Postgres) List(ctx context.Context, ownerID string, limit int) ([]goal.Goal, error) {
 	rows, err := p.pool.Query(ctx, `SELECT id::text,title,description,owner_id::text,parent_goal_id::text,priority,
-		success_criteria,constraints,autonomy_policy,review_policy,status,progress,created_at,updated_at,completed_at
+		success_criteria,structured_success_criteria,constraints,autonomy_policy,review_policy,status,progress,created_at,updated_at,completed_at
 		FROM goals WHERE owner_id=$1 ORDER BY priority DESC,created_at DESC LIMIT $2`, ownerID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list goals: %w", err)
@@ -117,7 +138,7 @@ func (p *Postgres) List(ctx context.Context, ownerID string, limit int) ([]goal.
 		var item goal.Goal
 		var parentID *string
 		if err := rows.Scan(&item.ID, &item.Title, &item.Description, &item.OwnerID, &parentID, &item.Priority,
-			&item.SuccessCriteria, &item.Constraints, &item.AutonomyPolicy, &item.ReviewPolicy, &item.Status, &item.Progress,
+			&item.SuccessCriteria, &item.Criteria, &item.Constraints, &item.AutonomyPolicy, &item.ReviewPolicy, &item.Status, &item.Progress,
 			&item.CreatedAt, &item.UpdatedAt, &item.CompletedAt); err != nil {
 			return nil, fmt.Errorf("scan goal: %w", err)
 		}
@@ -143,9 +164,19 @@ func (p *Postgres) CreateTask(ctx context.Context, item task.Task) (task.Task, e
 		return task.Task{}, fmt.Errorf("begin task transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if err := tx.QueryRow(ctx, `INSERT INTO tasks(goal_id,title,description,priority,status,success_criteria,attempt_count)
-		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id::text,created_at,updated_at`,
-		item.GoalID, item.Title, item.Description, item.Priority, item.Status, criteria, item.AttemptCount).Scan(&item.ID, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := lockGoalShared(ctx, tx, item.GoalID); err != nil && !errors.Is(err, ErrNotFound) {
+		return task.Task{}, fmt.Errorf("lock Goal before Task creation: %w", err)
+	}
+	criterionIDs, err := json.Marshal(item.CriterionIDs)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("encode task criterion mapping: %w", err)
+	}
+	if item.CriterionIDs == nil {
+		criterionIDs = []byte("[]")
+	}
+	if err := tx.QueryRow(ctx, `INSERT INTO tasks(goal_id,title,description,priority,status,success_criteria,attempt_count,plan_key,criterion_ids)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id::text,created_at,updated_at`,
+		item.GoalID, item.Title, item.Description, item.Priority, item.Status, criteria, item.AttemptCount, item.PlanKey, criterionIDs).Scan(&item.ID, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return task.Task{}, fmt.Errorf("insert task: %w", err)
 	}
 	if err := recordMutation(ctx, tx, LocalOwnerID, "task.created", "tasks", item.ID, item); err != nil {
@@ -173,9 +204,10 @@ func recordMutation(ctx context.Context, tx pgx.Tx, actor, eventType, resource, 
 
 func (p *Postgres) GetTask(ctx context.Context, id string) (task.Task, error) {
 	var item task.Task
-	err := p.pool.QueryRow(ctx, `SELECT id::text,goal_id::text,title,description,priority,status,attempt_count,success_criteria,
+	err := p.pool.QueryRow(ctx, `SELECT id::text,goal_id::text,title,description,priority,status,attempt_count,success_criteria,plan_key,criterion_ids,
 		scheduled_at,started_at,completed_at,created_at,updated_at FROM tasks WHERE id=$1`, id).Scan(
 		&item.ID, &item.GoalID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.AttemptCount, &item.SuccessCriteria,
+		&item.PlanKey, &item.CriterionIDs,
 		&item.ScheduledAt, &item.StartedAt, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task.Task{}, ErrNotFound
@@ -211,7 +243,7 @@ func (p *Postgres) taskDependencies(ctx context.Context, taskID string) ([]strin
 }
 
 func (p *Postgres) ListTasksByGoal(ctx context.Context, goalID string, limit int) ([]task.Task, error) {
-	rows, err := p.pool.Query(ctx, `SELECT t.id::text,t.goal_id::text,t.title,t.description,t.priority,t.status,t.attempt_count,t.success_criteria,
+	rows, err := p.pool.Query(ctx, `SELECT t.id::text,t.goal_id::text,t.title,t.description,t.priority,t.status,t.attempt_count,t.success_criteria,t.plan_key,t.criterion_ids,
 		t.scheduled_at,t.started_at,t.completed_at,t.created_at,t.updated_at,COALESCE(array_agg(d.depends_on_task_id::text) FILTER (WHERE d.depends_on_task_id IS NOT NULL), ARRAY[]::text[])
 		FROM tasks t LEFT JOIN task_dependencies d ON d.task_id=t.id WHERE t.goal_id=$1
 		GROUP BY t.id ORDER BY t.priority DESC,t.created_at LIMIT $2`, goalID, limit)
@@ -222,7 +254,7 @@ func (p *Postgres) ListTasksByGoal(ctx context.Context, goalID string, limit int
 	items := make([]task.Task, 0)
 	for rows.Next() {
 		var item task.Task
-		if err := rows.Scan(&item.ID, &item.GoalID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.AttemptCount, &item.SuccessCriteria,
+		if err := rows.Scan(&item.ID, &item.GoalID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.AttemptCount, &item.SuccessCriteria, &item.PlanKey, &item.CriterionIDs,
 			&item.ScheduledAt, &item.StartedAt, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt, &item.DependsOn); err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}

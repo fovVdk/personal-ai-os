@@ -1,6 +1,16 @@
 # Test and Validation Report
 
-Date: 2026-11-04 (updated after Phase 12 ModelAgent Tool Call integration)
+Date: 2026-11-04 (updated after Phase 12.2.3–12.2.5 foundations)
+
+## Phase 12.3 final verification addendum
+
+- `make fmt`, `make test`, `make build`, `make vet`: passed after Phase 12.3 code changes.
+- `go test -race ./...`: passed using Go 1.27.3 darwin/arm64.
+- `make build-arm64`: passed.
+- `make test-integration`: passed on isolated PostgreSQL 16/pgvector 0.8.7; all 16 migrations applied and injected migration rollback/retry passed. Coverage includes Goal Job claim/fencing/restart, Outbox lease expiry/redelivery/Approval wake/retry/dead-letter, Source Snapshot raw-data roundtrip/reference verification/immutability, Worker crash/checkpoint recovery, and PostgreSQL/Core restart.
+- Docker Compose config and YAML parse for Compose, config template and OpenAPI: passed.
+- Hosted Go 1.25 CI: pending; local Go 1.27.3 results are not substituted for hosted CI.
+- Complete single-scenario Autonomous Research Goal E2E: NOT VERIFIED; see [Autonomous Goal E2E report](AUTONOMOUS_GOAL_E2E_REPORT.md).
 
 ## Environment
 
@@ -35,6 +45,19 @@ Date: 2026-11-04 (updated after Phase 12 ModelAgent Tool Call integration)
 | Phase 12 ModelAgent unit/provider tests | Passed | Bounded model Tool Call roundtrips through the Core-injected Gateway caller; opaque alias binding, approval checkpoint/replay, and checkpoint exclusion/reconstruction of tool result content pass. OpenAI-compatible and Ollama message wire mappings pass. |
 | Migration 0010 + Goal Tool Call usage | Passed | Fresh PostgreSQL 16/pgvector 0.8.7 integration applies all ten migrations, validates failure rollback/retry, and checks durable Execution usage plus Gateway invocation-based cross-turn Tool Call accounting. |
 | Phase 12 full acceptance after latest edits | Passed | `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`, and `make test-integration`; integration target also runs full package/race/vet tests, Worker crash/checkpoint recovery, and PostgreSQL restart/fresh-Core persistence acceptance. |
+| Phase 12.2.1 Evaluator unit/API coverage | Passed | Covers missing criteria, unknown percentage, approvals, failures, dependency gaps, exhausted budgets, unverified claims, persisted evaluation history and the authenticated API endpoints. |
+| Migration 0011 Evaluation persistence | Passed | Fresh PostgreSQL 16/pgvector 0.8.7 applied all eleven migrations; injected migration failure rolled back and retried cleanly. Evaluation snapshot/history and transactional Audit/Outbox assertions passed. |
+| Goal completion safety regression | Passed | Durable task-recovery test confirms all verified Tasks lead to `awaiting_verification`, not automatic Goal completion. |
+| Phase 12.2.2 typed criteria and API | Passed | Validates `verified_evidence_count` and `verified_task_completion`, rejects unknown types/methods and invalid parameters, stamps API-authored criteria as user-confirmed, increments versions on revision, and migrates legacy strings only by explicit typed-criteria PATCH. |
+| Core-owned verifier boundary | Passed | Durable executor test proves an Agent cannot self-attest `Verified=true`; without a Core-injected verifier execution fails. With a verifier, only its Evidence and method are persisted. PostgreSQL execution stores/recovery also reject missing verifier provenance. |
+| Phase 12.2.2 Goal completion transaction | Passed | Fresh PostgreSQL evaluation matches required criteria to verified execution evidence; a Task change invalidates the old evaluation, caller-supplied prose is ignored, and completion Evidence links back to the Evaluation/Criterion. |
+| Migration 0012 typed criteria | Passed | Fresh PostgreSQL 16/pgvector 0.8.7 applied all twelve migrations; failure rollback/retry, structured criteria roundtrip, evaluation, completion gating and cleanup passed. |
+| Phase 12.2.2 full acceptance | Passed | `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`, `make build-arm64`, `make test-integration`, Compose parse and Compose/config/OpenAPI YAML parse all passed. Integration includes Worker crash/checkpoint recovery and database/Core restart tests. |
+| Phase 12.2.3 Artifact Verifier | Passed | Real filesystem tests verify root-relative Markdown existence/size/heading rules and SHA-256; traversal/missing path rejected. Real PostgreSQL execution/evaluation records verifier provenance and FK Evidence links. Content mutation after Evaluation is rejected by rehashing under Goal completion transaction; restoring verified bytes permits completion. |
+| Phase 12.2.4 Versioned Plan Proposal | Passed | Real PostgreSQL commits Plan v1 and v2; v2 retains a completed Task without re-execution and atomically adds a dependent Task. Concurrent proposal with stale base is marked conflict. Proposal with no executable additions is rejected and current version retained. |
+| Phase 12.2.5 Decision persistence | Passed | Evaluation and deterministic Decision are saved in one transaction with Audit/Outbox; repeated identical facts reuse one Decision. Decision fingerprint includes criteria versions/evidence hashes, Task status, blockers and budgets.
+| Phase 12.2.6 autonomous Goal E2E | Partial / not claimed complete | PostgreSQL integration exercises artifact verification/hash invalidation, Plan conflict/retention, failure recovery, Worker crash/checkpoint and Core/database restart as separate fixtures. It does not execute one full technical research Goal with authentic reference snapshots, semantic report verification, approval during the same controller loop and final restart. Source snapshot collector, production report Agent and durable background Supervisor Job are not implemented. |
+| Phase 12.2.x final combined regression | Passed | Latest local `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`, `make build-arm64`, YAML validation and isolated `make test-integration` passed. Fresh PostgreSQL applied migrations 0001–0013 and covered Verification/Evidence FK, stale Artifact Hash rejection, Plan v1→v2 retention/conflict/no-progress behavior, idempotent Decisions, Worker crash/checkpoint and PostgreSQL/Core restart. |
 
 Latest Phase 10 integration run also fixed an SQL issue in `VerifiedTaskIDs`: PostgreSQL requires `ORDER BY` expressions in a `SELECT DISTINCT` query to match the selected expression. The query now orders by the selected text-cast Task ID; the restarted Supervisor safely returns HTTP 409 for the unverified Mock result, after which a verified Worker completes the pending Task.
 
@@ -48,6 +71,10 @@ Latest Phase 10 integration run also fixed an SQL issue in `VerifiedTaskIDs`: Po
 - Mock/OpenAI-compatible/Ollama Model Gateway behavior and untrusted tool-call schema/allowlist validation
 - ModelAgent bounded assistant Tool Call/tool-result loops, exact alias-to-Registry identity mapping, Approval checkpoint continuation, and result reconstruction from durable Gateway replay without checkpointing result payloads
 - Goal Tool Call budget aggregation from durable Invocation records and persisted Execution usage
+- Conservative Goal Evaluator recommendations from lifecycle, task states/dependencies, Core-verifier-backed execution evidence, and model/tool budgets; legacy free-form criteria remain unknown and completion percentage remains unset
+- Typed Goal Success Criteria validation/versioning and deterministic evidence-count/verified-task rules, plus stale Evaluation invalidation and transactionally derived Goal completion Evidence
+- Core-owned `ResultVerifier` boundary; Agent self-reported `Verified` is ignored, missing verifier provenance is not accepted for Task recovery or Goal criterion satisfaction
+- Core filesystem ArtifactVerifier, content hash/criterion version binding, persisted Verification history, Goal completion rehash check, versioned Plan proposal stale/conflict/no-progress behavior, retained completed Task and idempotent Decision history
 - Tool Registry stable provider/Tool/version identity, schema validation, health/enabled state, and default-deny Policy grants
 - Tool Gateway Lease/Fencing gates, canonical Tool-version argument hash, Approval binding and one-time consumption, Core-observed budget, output validation, and unknown outcomes
 - Native `time.now`, authorized-root filesystem traversal/symlink tests, owner-scoped Memory/Knowledge search registration, HTTP allowlist/private destination denial, and authenticated Tool metadata endpoints

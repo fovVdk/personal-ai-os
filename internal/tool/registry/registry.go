@@ -86,6 +86,21 @@ type Handler interface {
 	Execute(context.Context, json.RawMessage) (json.RawMessage, error)
 }
 
+// InvocationContext contains request identity copied by the Tool Gateway after validation.
+// Tool arguments cannot override these fields.
+type InvocationContext struct {
+	GoalID      string
+	TaskID      string
+	ExecutionID string
+	StepID      string
+	AgentID     string
+}
+
+// ContextualHandler is optional for Tools that must bind durable records to the verified invocation.
+type ContextualHandler interface {
+	ExecuteWithContext(context.Context, InvocationContext, json.RawMessage) (json.RawMessage, error)
+}
+
 type Registered struct {
 	Entry   Entry
 	Handler Handler

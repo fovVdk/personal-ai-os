@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	agentruntime "personal-ai-os/internal/agent/runtime"
 	"personal-ai-os/internal/supervisor"
@@ -28,19 +30,34 @@ func (s *ExecutionStore) Save(ctx context.Context, item supervisor.Execution) (s
 	if item.Outcome != agentruntime.OutcomeSucceeded {
 		return supervisor.Execution{}, fmt.Errorf("only verified successful executions can be stored as succeeded")
 	}
+	if item.Verified && strings.TrimSpace(item.VerificationMethod) == "" {
+		return supervisor.Execution{}, fmt.Errorf("verified execution requires Core verifier provenance")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return supervisor.Execution{}, fmt.Errorf("begin execution persistence: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	var goalID string
+	if err := tx.QueryRow(ctx, "SELECT goal_id::text FROM tasks WHERE id=$1", item.TaskID).Scan(&goalID); err != nil {
+		return supervisor.Execution{}, fmt.Errorf("load execution Task Goal: %w", err)
+	}
+	if err := lockGoalShared(ctx, tx, goalID); err != nil {
+		return supervisor.Execution{}, fmt.Errorf("lock Goal before execution evidence persistence: %w", err)
+	}
 	var runID string
 	err = tx.QueryRow(ctx, `INSERT INTO execution_runs(task_id,status,idempotency_key,input_hash,result,attempt,completed_at)
 		VALUES($1,'succeeded',$2,$3,$4,1,$5) RETURNING id::text`, item.TaskID, "mock-execution:"+item.TaskID, fmt.Sprintf("%x", sha256.Sum256([]byte(item.TaskID+"\x00"+item.AgentID))), payload, item.CompletedAt).Scan(&runID)
 	if err != nil {
 		return supervisor.Execution{}, fmt.Errorf("insert execution run: %w", err)
 	}
-	for _, evidence := range item.Evidence {
-		if _, err := tx.Exec(ctx, `INSERT INTO execution_evidence(execution_run_id,source,description,reference,observed_at) VALUES($1,$2,$3,$4,$5)`, runID, evidence.Source, evidence.Description, evidence.Reference, evidence.ObservedAt); err != nil {
+	for i := range item.Evidence {
+		evidence := &item.Evidence[i]
+		if strings.TrimSpace(evidence.Source) == "" || strings.TrimSpace(evidence.Description) == "" {
+			return supervisor.Execution{}, fmt.Errorf("execution evidence source and description are required")
+		}
+		if err := tx.QueryRow(ctx, `INSERT INTO execution_evidence(execution_run_id,source,description,reference,observed_at,criterion_id,criterion_version,content_hash,verifier_type,verifier_version)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id::text`, runID, evidence.Source, evidence.Description, evidence.Reference, evidence.ObservedAt.UTC(), evidence.CriterionID, evidence.CriterionVersion, evidence.ContentHash, evidence.VerifierType, evidence.VerifierVersion).Scan(&evidence.EvidenceID); err != nil {
 			return supervisor.Execution{}, fmt.Errorf("insert execution evidence: %w", err)
 		}
 	}
@@ -65,7 +82,6 @@ func (s *ExecutionStore) ListByGoal(ctx context.Context, goalID string) ([]super
 	if err != nil {
 		return nil, fmt.Errorf("list goal executions: %w", err)
 	}
-	defer rows.Close()
 	items := make([]supervisor.Execution, 0)
 	for rows.Next() {
 		var id string
@@ -83,7 +99,37 @@ func (s *ExecutionStore) ListByGoal(ctx context.Context, goalID string) ([]super
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, fmt.Errorf("iterate executions: %w", err)
+	}
+	rows.Close()
+	for i := range items {
+		items[i].Evidence, err = s.listEvidence(ctx, items[i].ID, items[i].TaskID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return items, nil
+}
+
+func (s *ExecutionStore) listEvidence(ctx context.Context, runID, taskID string) ([]supervisor.Evidence, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text,source,description,COALESCE(reference,''),observed_at,criterion_id,criterion_version,content_hash,verifier_type,verifier_version
+		FROM execution_evidence WHERE execution_run_id=$1 ORDER BY observed_at,id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list persisted execution evidence: %w", err)
+	}
+	defer rows.Close()
+	items := make([]supervisor.Evidence, 0)
+	for rows.Next() {
+		var item supervisor.Evidence
+		item.TaskID = taskID
+		if err := rows.Scan(&item.EvidenceID, &item.Source, &item.Description, &item.Reference, &item.ObservedAt, &item.CriterionID, &item.CriterionVersion, &item.ContentHash, &item.VerifierType, &item.VerifierVersion); err != nil {
+			return nil, fmt.Errorf("scan persisted execution evidence: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate persisted execution evidence: %w", err)
 	}
 	return items, nil
 }

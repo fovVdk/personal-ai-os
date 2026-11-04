@@ -19,14 +19,16 @@ import (
 
 	"personal-ai-os/internal/knowledge"
 	"personal-ai-os/internal/memory"
+	"personal-ai-os/internal/source"
 	"personal-ai-os/internal/tool/registry"
 )
 
 const (
-	providerID   = "paios.native"
-	toolVersion  = "v1"
-	maxFileBytes = 512 << 10
-	maxHTTPBytes = 1 << 20
+	providerID         = "paios.native"
+	toolVersion        = "v1"
+	maxFileBytes       = 512 << 10
+	maxHTTPBytes       = 1 << 20
+	maxSourceToolBytes = 512 << 10
 )
 
 type Options struct {
@@ -34,6 +36,7 @@ type Options struct {
 	OwnerID               string
 	Memories              memory.Repository
 	Knowledge             knowledge.Repository
+	Sources               source.Repository
 	HTTPFetchAllowedHosts []string
 	Now                   func() time.Time
 }
@@ -94,8 +97,70 @@ func Register(tools *registry.Registry, options Options) error {
 		if err := register(tools, definition("http.fetch", "Fetch a public HTTP(S) URL from an exact allowlisted host", `{"url":{"type":"string"}}`, []string{"url"}, "result", registry.KindReadOnly, 1), fetch); err != nil {
 			return err
 		}
+		if options.Sources != nil {
+			fetcher, err := source.NewFetcher(options.HTTPFetchAllowedHosts)
+			if err != nil {
+				return fmt.Errorf("configure source snapshot fetcher: %w", err)
+			}
+			if options.OwnerID == "" {
+				return errors.New("source snapshot Tool requires an owner id")
+			}
+			capture := sourceCapture{ownerID: options.OwnerID, fetcher: fetcher, repository: options.Sources}
+			if err := register(tools, definition("source.capture", "Fetch an allowlisted public source and persist an immutable snapshot", `{"url":{"type":"string"}}`, []string{"url"}, "result", registry.KindMutation, 1), capture); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+type sourceCapture struct {
+	ownerID string
+	fetcher interface {
+		Fetch(context.Context, string) (source.Snapshot, error)
+	}
+	repository source.Repository
+}
+
+func (h sourceCapture) Execute(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return nil, errors.New("source capture requires a Gateway-verified Goal and Task context")
+}
+
+func (h sourceCapture) ExecuteWithContext(ctx context.Context, invocation registry.InvocationContext, args json.RawMessage) (json.RawMessage, error) {
+	if invocation.GoalID == "" || invocation.TaskID == "" || invocation.ExecutionID == "" || invocation.StepID == "" {
+		return nil, errors.New("source capture requires verified Goal, Task, Execution and Step identifiers")
+	}
+	var input struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, err
+	}
+	snapshot, err := h.fetcher.Fetch(ctx, input.URL)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.OwnerID, snapshot.GoalID, snapshot.TaskID = h.ownerID, invocation.GoalID, invocation.TaskID
+	snapshot, err = h.repository.Create(ctx, snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("persist source snapshot: %w", err)
+	}
+	content := snapshot.NormalizedContent
+	truncated := false
+	if len(content) > maxSourceToolBytes {
+		content = strings.ToValidUTF8(content[:maxSourceToolBytes], "�")
+		truncated = true
+	}
+	result, err := json.Marshal(map[string]any{
+		"source_id": snapshot.ID, "original_url": snapshot.OriginalURL, "final_url": snapshot.FinalURL,
+		"http_status": snapshot.HTTPStatus, "mime_type": snapshot.MIMEType, "retrieved_at": snapshot.RetrievedAt,
+		"content_hash": snapshot.ContentHash, "fetcher_version": snapshot.FetcherVersion,
+		"untrusted_source_content": content, "content_truncated": truncated,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resultJSON(string(result))
 }
 
 type handlerFunc func(context.Context, json.RawMessage) (json.RawMessage, error)

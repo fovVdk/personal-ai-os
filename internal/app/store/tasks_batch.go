@@ -20,6 +20,15 @@ func (p *Postgres) CreateTasks(ctx context.Context, items []task.Task) ([]task.T
 		return nil, fmt.Errorf("begin task plan transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	goalID := items[0].GoalID
+	for _, item := range items[1:] {
+		if item.GoalID != goalID {
+			return nil, fmt.Errorf("a single Plan transaction cannot span multiple Goals")
+		}
+	}
+	if err := lockGoalShared(ctx, tx, goalID); err != nil {
+		return nil, fmt.Errorf("lock Goal before planned Task creation: %w", err)
+	}
 	created := make([]task.Task, len(items))
 	ids := make(map[string]string, len(items))
 	for i, item := range items {
@@ -39,8 +48,15 @@ func (p *Postgres) CreateTasks(ctx context.Context, items []task.Task) ([]task.T
 		if item.SuccessCriteria == nil {
 			criteria = []byte("[]")
 		}
-		err = tx.QueryRow(ctx, `INSERT INTO tasks(goal_id,title,description,priority,status,success_criteria,attempt_count)
-			VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id::text,created_at,updated_at`, item.GoalID, item.Title, item.Description, item.Priority, item.Status, criteria, item.AttemptCount).Scan(&item.ID, &item.CreatedAt, &item.UpdatedAt)
+		criterionIDs, err := json.Marshal(item.CriterionIDs)
+		if err != nil {
+			return nil, fmt.Errorf("encode task criterion mapping: %w", err)
+		}
+		if item.CriterionIDs == nil {
+			criterionIDs = []byte("[]")
+		}
+		err = tx.QueryRow(ctx, `INSERT INTO tasks(goal_id,title,description,priority,status,success_criteria,attempt_count,plan_key,criterion_ids)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id::text,created_at,updated_at`, item.GoalID, item.Title, item.Description, item.Priority, item.Status, criteria, item.AttemptCount, item.PlanKey, criterionIDs).Scan(&item.ID, &item.CreatedAt, &item.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("insert planned task: %w", err)
 		}

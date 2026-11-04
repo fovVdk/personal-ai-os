@@ -250,8 +250,8 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 			t.Fatalf("restarted Core lost completed Task %d state: %+v", i+1, got)
 		}
 	}
-	if got := coreTaskByID[createdTasks[4].ID]; got.Status != task.Created {
-		t.Fatalf("restarted Core lost the pending dependent Task: %+v", got)
+	if got := coreTaskByID[createdTasks[4].ID]; got.Status != task.Created && got.Status != task.Ready {
+		t.Fatalf("restarted Core lost or invalidated the pending dependent Task: %+v", got)
 	}
 	turnBody, _ := json.Marshal(map[string]string{"goal_id": goalItem.ID})
 	turnRequest, err := http.NewRequest(http.MethodPost, core.baseURL+"/api/v1/supervisor/turn", strings.NewReader(string(turnBody)))
@@ -273,7 +273,10 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 		_ = pool.QueryRow(ctx, "SELECT status FROM tasks WHERE id=$1", createdTasks[4].ID).Scan(&taskStatus)
 		var runStatuses string
 		_ = pool.QueryRow(ctx, "SELECT COALESCE(string_agg(status||':'||failure_reason, ';' ORDER BY started_at),'') FROM execution_runs WHERE task_id=$1", createdTasks[4].ID).Scan(&runStatuses)
-		t.Fatalf("Core Supervisor turn status=%d want=%d body=%s task=%s runs=%s logs=%s", turnResponse.StatusCode, http.StatusConflict, turnResponseBody, taskStatus, runStatuses, core.logs.String())
+		var plans, proposals string
+		_ = pool.QueryRow(ctx, "SELECT COALESCE(string_agg(version::text||':'||status,','),'') FROM plan_versions WHERE goal_id=$1", goalItem.ID).Scan(&plans)
+		_ = pool.QueryRow(ctx, "SELECT COALESCE(string_agg(status||':'||reason,','),'') FROM plan_proposals WHERE goal_id=$1", goalItem.ID).Scan(&proposals)
+		t.Fatalf("Core Supervisor turn status=%d want=%d body=%s task=%s runs=%s plans=%s proposals=%s logs=%s", turnResponse.StatusCode, http.StatusConflict, turnResponseBody, taskStatus, runStatuses, plans, proposals, core.logs.String())
 	}
 	lastTask, err = tasks.Get(ctx, createdTasks[4].ID)
 	if err != nil || lastTask.Status != task.Failed {
@@ -448,7 +451,7 @@ func (executor *acceptanceCheckpointExecutor) Execute(ctx context.Context, run e
 		}
 	}
 	completedAt := time.Now().UTC()
-	result, err := json.Marshal(supervisor.Execution{TaskID: run.TaskID, AgentID: run.AgentID, Summary: "independently verified integration artifact", Outcome: agentruntime.OutcomeSucceeded, Verified: true, Evidence: []supervisor.Evidence{{TaskID: run.TaskID, Source: "durable-recovery-acceptance", Description: "all declared steps and dependency checks completed", ObservedAt: completedAt}}, CompletedAt: completedAt})
+	result, err := json.Marshal(supervisor.Execution{TaskID: run.TaskID, AgentID: run.AgentID, Summary: "independently verified integration artifact", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "integration-harness-verifier/v1", Evidence: []supervisor.Evidence{{TaskID: run.TaskID, Source: "durable-recovery-acceptance", Description: "all declared steps and dependency checks completed", ObservedAt: completedAt}}, CompletedAt: completedAt})
 	if err != nil {
 		return execution.ExecutionResult{}, err
 	}

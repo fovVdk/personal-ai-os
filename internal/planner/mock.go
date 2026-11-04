@@ -5,6 +5,8 @@ package planner
 import (
 	"context"
 	"fmt"
+
+	goaldomain "personal-ai-os/internal/goal"
 )
 
 // MockGenerator produces a conservative, deterministic plan without external models.
@@ -30,6 +32,18 @@ func (MockGenerator) GenerateContext(ctx context.Context, goal GoalInput) (Plan,
 			{Key: "roadmap", Title: "Create implementation roadmap and estimates", Description: "Break the architecture into independently reviewable phases with dependencies and cost ranges.", SuccessCriteria: []string{"Ordered phases, dependencies, and estimates are prepared"}, DependsOn: []string{"architecture"}, EstimatedHours: 2},
 			{Key: "safety-review", Title: "Review privacy, security, and safety risks", Description: "Review network exposure, credentials, data handling, failure behavior, and approval needs before any side effects.", SuccessCriteria: []string{"Risks and mitigations are reviewed by the owner"}, DependsOn: []string{"roadmap"}, EstimatedHours: 1.5},
 		},
+	}
+	if len(goal.Criteria) > 0 {
+		for _, criterion := range goal.Criteria {
+			// The deterministic planner assigns the acceptance contract to its
+			// requirements checkpoint; this is a planning mapping, not evidence.
+			index := 0
+			if criterion.Type == goaldomain.CriterionArtifactExists || criterion.Type == goaldomain.CriterionMarkdownStructure {
+				index = len(plan.Tasks) - 1
+			}
+			plan.Tasks[index].CriterionIDs = append(plan.Tasks[index].CriterionIDs, criterion.ID)
+			plan.Tasks[index].EvidenceRequirements = append(plan.Tasks[index].EvidenceRequirements, fmt.Sprintf("Collect Core-verifiable evidence for criterion %s: %s", criterion.ID, criterion.Name))
+		}
 	}
 	for _, task := range plan.Tasks {
 		plan.EstimatedHours += task.EstimatedHours

@@ -25,27 +25,34 @@ var ErrNoReadyTasks = errors.New("goal has no ready tasks")
 var ErrUnverifiedResult = errors.New("agent result is unverified and cannot complete the task")
 
 type Evidence struct {
-	TaskID      string    `json:"task_id"`
-	Source      string    `json:"source"`
-	Description string    `json:"description"`
-	Reference   string    `json:"reference,omitempty"`
-	ObservedAt  time.Time `json:"observed_at"`
+	EvidenceID       string    `json:"evidence_id,omitempty"`
+	TaskID           string    `json:"task_id"`
+	CriterionID      string    `json:"criterion_id,omitempty"`
+	CriterionVersion int       `json:"criterion_version,omitempty"`
+	Source           string    `json:"source"`
+	Description      string    `json:"description"`
+	Reference        string    `json:"reference,omitempty"`
+	ContentHash      string    `json:"content_hash,omitempty"`
+	VerifierType     string    `json:"verifier_type,omitempty"`
+	VerifierVersion  string    `json:"verifier_version,omitempty"`
+	ObservedAt       time.Time `json:"observed_at"`
 }
 
 type Execution struct {
-	ID           string               `json:"id,omitempty"`
-	TaskID       string               `json:"task_id"`
-	AgentID      string               `json:"agent_id"`
-	Summary      string               `json:"summary"`
-	Outcome      agentruntime.Outcome `json:"outcome"`
-	InputTokens  int                  `json:"input_tokens"`
-	OutputTokens int                  `json:"output_tokens"`
-	TotalTokens  int                  `json:"total_tokens"`
-	ModelCalls   int                  `json:"model_calls"`
-	ToolCalls    int                  `json:"tool_calls"`
-	Evidence     []Evidence           `json:"evidence"`
-	CompletedAt  time.Time            `json:"completed_at"`
-	Verified     bool                 `json:"verified"`
+	ID                 string               `json:"id,omitempty"`
+	TaskID             string               `json:"task_id"`
+	AgentID            string               `json:"agent_id"`
+	Summary            string               `json:"summary"`
+	Outcome            agentruntime.Outcome `json:"outcome"`
+	InputTokens        int                  `json:"input_tokens"`
+	OutputTokens       int                  `json:"output_tokens"`
+	TotalTokens        int                  `json:"total_tokens"`
+	ModelCalls         int                  `json:"model_calls"`
+	ToolCalls          int                  `json:"tool_calls"`
+	Evidence           []Evidence           `json:"evidence"`
+	CompletedAt        time.Time            `json:"completed_at"`
+	Verified           bool                 `json:"verified"`
+	VerificationMethod string               `json:"verification_method,omitempty"`
 }
 
 type ExecutionStore interface {
@@ -83,7 +90,11 @@ type Supervisor struct {
 	Tasks            task.Repository
 	Planner          planner.Generator
 	Agents           *agentregistry.Registry
+	Verifier         agentruntime.ResultVerifier
 	Executions       ExecutionStore
+	Evaluations      EvaluationStore
+	Decisions        DecisionStore
+	Plans            planner.ProposalRepository
 	Runtime          DurableRuntime
 	Usage            UsageStore
 	Recovery         StatusStore
@@ -146,7 +157,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		}
 	}
 	for _, execution := range savedExecutions {
-		if execution.Outcome == agentruntime.OutcomeSucceeded && execution.Verified && len(execution.Evidence) > 0 {
+		if execution.Outcome == agentruntime.OutcomeSucceeded && execution.Verified && strings.TrimSpace(execution.VerificationMethod) != "" && len(execution.Evidence) > 0 {
 			succeeded[execution.TaskID] = struct{}{}
 		}
 	}
@@ -206,13 +217,73 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 	if err != nil {
 		return TurnResult{}, fmt.Errorf("load goal tasks: %w", err)
 	}
+	if s.Evaluations != nil {
+		evaluation, evalErr := s.EvaluateGoal(runCtx, goalItem.ID)
+		if evalErr != nil {
+			return TurnResult{}, fmt.Errorf("evaluate Goal before decision: %w", evalErr)
+		}
+		switch evaluation.RecommendedAction {
+		case ActionWaitApproval:
+			return TurnResult{Goal: goalItem, Tasks: tasks, Status: string(execution.StatusWaitingApproval)}, nil
+		case ActionWaitCondition:
+			return TurnResult{Goal: goalItem, Tasks: tasks, Status: string(execution.StatusWaitingExternal)}, nil
+		case ActionStop:
+			status := "stopped"
+			if decisionType, _ := decisionForEvaluation(evaluation); decisionType == DecisionBudgetExhausted {
+				status = "budget_exhausted"
+			}
+			return TurnResult{Goal: goalItem, Tasks: tasks, Status: status}, nil
+		case ActionVerifyCompletion:
+			completionEvidence := []goal.Evidence{{Source: "core-criterion-verifier", Description: "all required, current structured success criteria have persisted Core Verification records", Reference: "evaluation:" + evaluation.ID, ObservedAt: evaluation.CreatedAt}}
+			goalItem, err = s.Goals.Transition(runCtx, goalOwnerID(), goalItem.ID, goal.Completed, completionEvidence)
+			if err != nil {
+				if errors.Is(err, goal.ErrCriteriaUnverified) {
+					return TurnResult{Goal: goalItem, Tasks: tasks, Status: "awaiting_verification"}, nil
+				}
+				return TurnResult{}, fmt.Errorf("complete Goal after verified criteria: %w", err)
+			}
+			return TurnResult{Goal: goalItem, Tasks: tasks, Status: string(goal.Completed)}, nil
+		}
+		replanTrigger := len(evaluation.FailedTasks) > 0 || len(evaluation.BlockedTasks) > 0
+		for _, unmet := range evaluation.UnmetCriteria {
+			if unmet.Status == "insufficient_evidence" || unmet.Status == "unsupported" {
+				replanTrigger = true
+				break
+			}
+		}
+		if s.Plans != nil && len(tasks) > 0 && replanTrigger && (evaluation.RecommendedAction == ActionReplan || evaluation.RecommendedAction == ActionEscalate) {
+			currentVersion := 0
+			if current, planErr := s.Plans.GetCurrentPlan(runCtx, goalItem.ID); planErr == nil {
+				currentVersion = current.Version
+			} else if !errors.Is(planErr, planner.ErrPlanConflict) {
+				return TurnResult{}, fmt.Errorf("load Plan Version before replan: %w", planErr)
+			}
+			if currentVersion >= 10 {
+				return TurnResult{Goal: goalItem, Tasks: tasks, Status: "replan_budget_exhausted"}, nil
+			}
+			proposal, proposeErr := s.ProposePlan(runCtx, goalItem.ID)
+			if proposeErr != nil {
+				return TurnResult{Goal: goalItem, Tasks: tasks, Status: "replan_required"}, proposeErr
+			}
+			if _, err := s.AcceptPlanProposal(runCtx, goalItem.ID, proposal.ID); err != nil {
+				if errors.Is(err, planner.ErrNoPlanProgress) {
+					return TurnResult{Goal: goalItem, Tasks: tasks, Status: "no_progress"}, nil
+				}
+				return TurnResult{Goal: goalItem, Tasks: tasks, Status: "plan_proposal_pending"}, err
+			}
+			tasks, err = s.Tasks.ListByGoal(runCtx, goalItem.ID, 200)
+			if err != nil {
+				return TurnResult{}, fmt.Errorf("reload Tasks after committed replan: %w", err)
+			}
+		}
+	}
 	plan := planner.Plan{GoalID: goalItem.ID}
 	plannerModelCalls, plannerModelTokens := 0, 0
 	if len(tasks) == 0 {
 		if usedUsage.ModelCalls >= budgets.MaxModelCalls || usedUsage.ModelTokens >= budgets.MaxModelTokens {
 			return TurnResult{}, errors.New("supervisor model budget exhausted before planning")
 		}
-		plan, err = s.Planner.GenerateContext(runCtx, planner.GoalInput{ID: goalItem.ID, Title: goalItem.Title, Description: goalItem.Description, SuccessCriteria: goalItem.SuccessCriteria, Constraints: goalItem.Constraints})
+		plan, err = s.Planner.GenerateContext(runCtx, planner.GoalInput{ID: goalItem.ID, Title: goalItem.Title, Description: goalItem.Description, SuccessCriteria: goalItem.SuccessCriteria, Criteria: goalItem.Criteria, Constraints: goalItem.Constraints})
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("generate plan: %w", err)
 		}
@@ -228,17 +299,42 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 				return TurnResult{}, fmt.Errorf("persist planner token usage: %w", err)
 			}
 		}
-		tasks = make([]task.Task, len(plan.Tasks))
-		for i, spec := range plan.Tasks {
-			tasks[i] = task.Task{GoalID: goalItem.ID, PlanKey: spec.Key, Title: spec.Title, Description: spec.Description, Priority: 3, Status: task.Created, SuccessCriteria: spec.SuccessCriteria, DependsOn: spec.DependsOn}
-		}
-		tasks, err = s.Tasks.CreateMany(runCtx, tasks)
-		if err != nil {
-			return TurnResult{}, fmt.Errorf("persist plan: %w", err)
+		if s.Plans != nil {
+			proposal := planner.PlanProposal{GoalID: goalItem.ID, BasePlanVersion: 0, ProposedVersion: 1, Trigger: "initial_plan", Reason: plan.Summary, Plan: plan, CreatedAt: now, ExpiresAt: now.Add(30 * time.Minute)}
+			if err := proposal.Validate(goalItem.Criteria, len(tasks), 200); err != nil {
+				return TurnResult{}, fmt.Errorf("validate initial Plan Proposal: %w", err)
+			}
+			proposal, err = s.Plans.CreateProposal(runCtx, proposal)
+			if err != nil {
+				return TurnResult{}, fmt.Errorf("persist initial Plan Proposal: %w", err)
+			}
+			if _, err := s.Plans.AcceptProposal(runCtx, goalItem.ID, proposal.ID, 200); err != nil {
+				return TurnResult{}, fmt.Errorf("commit initial Plan Proposal: %w", err)
+			}
+			tasks, err = s.Tasks.ListByGoal(runCtx, goalItem.ID, 200)
+			if err != nil {
+				return TurnResult{}, fmt.Errorf("reload committed plan tasks: %w", err)
+			}
+		} else {
+			tasks = make([]task.Task, len(plan.Tasks))
+			for i, spec := range plan.Tasks {
+				tasks[i] = task.Task{GoalID: goalItem.ID, PlanKey: spec.Key, CriterionIDs: spec.CriterionIDs, Title: spec.Title, Description: spec.Description, Priority: 3, Status: task.Created, SuccessCriteria: spec.SuccessCriteria, DependsOn: spec.DependsOn}
+			}
+			tasks, err = s.Tasks.CreateMany(runCtx, tasks)
+			if err != nil {
+				return TurnResult{}, fmt.Errorf("persist plan: %w", err)
+			}
 		}
 	}
 	if plan.GoalID == "" {
 		plan.Summary = "Existing goal tasks will be executed according to their persisted state."
+		if s.Plans != nil {
+			if current, planErr := s.Plans.GetCurrentPlan(runCtx, goalItem.ID); planErr == nil {
+				plan = current.Plan
+			} else if !errors.Is(planErr, planner.ErrPlanConflict) {
+				return TurnResult{}, fmt.Errorf("load current Plan Version: %w", planErr)
+			}
+		}
 	}
 	completed := make(map[string]struct{}, len(tasks))
 	for _, item := range tasks {
@@ -338,7 +434,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		if remainingCalls < 0 {
 			return TurnResult{}, errors.New("supervisor model call budget exceeded")
 		}
-		agentRequest := agentruntime.Request{TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - usedUsage.ToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline}
+		agentRequest := agentruntime.Request{OwnerID: goalItem.OwnerID, TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, GoalCriteria: goalItem.Criteria, TaskCriterionIDs: selected.CriterionIDs, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - usedUsage.ToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline}
 		if s.Runtime != nil {
 			declaration, hasIdempotencyGuarantee := profile.Agent.(agentruntime.IdempotencyDeclaration)
 			idempotent := hasIdempotencyGuarantee && declaration.IdempotencyGuarantee()
@@ -384,6 +480,27 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 			}
 			return TurnResult{}, fmt.Errorf("execute task %s: %w", selected.ID, runErr)
 		}
+		if s.Verifier == nil {
+			failedCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, transitionErr := s.Tasks.Transition(failedCtx, selected.ID, task.Failed)
+			cancelFailure()
+			if transitionErr != nil {
+				return TurnResult{}, fmt.Errorf("independent verifier is unavailable and task status update failed: %w", transitionErr)
+			}
+			return TurnResult{}, ErrUnverifiedResult
+		}
+		verification, verifyErr := s.Verifier.Verify(runCtx, agentRequest, agentResult)
+		if verifyErr != nil || !verification.Verified || strings.TrimSpace(verification.Method) == "" || len(verification.Evidence) == 0 {
+			failedCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, transitionErr := s.Tasks.Transition(failedCtx, selected.ID, task.Failed)
+			cancelFailure()
+			if transitionErr != nil {
+				return TurnResult{}, fmt.Errorf("result verification failed (%v) and task status update failed: %w", verifyErr, transitionErr)
+			}
+			return TurnResult{}, ErrUnverifiedResult
+		}
+		agentResult.Evidence = verification.Evidence
+		agentResult.Verified = true
 		if agentResult.Outcome != agentruntime.OutcomeSucceeded || agentResult.Steps < 1 || agentResult.Steps > budgets.MaxSteps-step || len(agentResult.Evidence) == 0 {
 			failedCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			_, transitionErr := s.Tasks.Transition(failedCtx, selected.ID, task.Failed)
@@ -430,9 +547,9 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		}
 		evidence := make([]Evidence, 0, len(agentResult.Evidence))
 		for _, item := range agentResult.Evidence {
-			evidence = append(evidence, Evidence{TaskID: selected.ID, Source: item.Source, Description: item.Description, Reference: item.Reference, ObservedAt: completedAt})
+			evidence = append(evidence, Evidence{TaskID: selected.ID, CriterionID: item.CriterionID, CriterionVersion: item.CriterionVersion, Source: item.Source, Description: item.Description, Reference: item.Reference, ContentHash: item.ContentHash, VerifierType: item.VerifierType, VerifierVersion: item.VerifierVersion, ObservedAt: completedAt})
 		}
-		execution, err := s.Executions.Save(runCtx, Execution{TaskID: selected.ID, AgentID: profile.ID, Summary: agentResult.Summary, Outcome: agentResult.Outcome, InputTokens: agentResult.InputTokens, OutputTokens: agentResult.OutputTokens, TotalTokens: agentResult.ModelTokens, ModelCalls: agentResult.ModelCalls, ToolCalls: agentResult.ToolCalls, Evidence: evidence, CompletedAt: completedAt})
+		execution, err := s.Executions.Save(runCtx, Execution{TaskID: selected.ID, AgentID: profile.ID, Summary: agentResult.Summary, Outcome: agentResult.Outcome, InputTokens: agentResult.InputTokens, OutputTokens: agentResult.OutputTokens, TotalTokens: agentResult.ModelTokens, ModelCalls: agentResult.ModelCalls, ToolCalls: agentResult.ToolCalls, Evidence: evidence, CompletedAt: completedAt, Verified: true, VerificationMethod: verification.Method})
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("persist execution evidence: %w", err)
 		}
@@ -443,19 +560,16 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		completed[selected.ID] = struct{}{}
 		results = append(results, execution)
 	}
-	if len(tasks) > 0 && len(completed) == len(tasks) {
-		goalEvidence := []goal.Evidence{{Source: "task-executions", Description: fmt.Sprintf("%d goal tasks completed with persisted agent evidence", len(tasks)), Reference: goalItem.ID, ObservedAt: now}}
-		goalItem, err = s.Goals.Transition(runCtx, goalOwnerID(), goalItem.ID, goal.Completed, goalEvidence)
-		if err != nil {
-			return TurnResult{}, fmt.Errorf("complete goal: %w", err)
-		}
-	} else if len(completed) > 0 && goalItem.Status == goal.Active {
+	if len(completed) > 0 && goalItem.Status == goal.Active {
 		goalItem, err = s.Goals.Transition(runCtx, goalOwnerID(), goalItem.ID, goal.Monitoring, nil)
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("set goal monitoring: %w", err)
 		}
 	}
 	if len(results) == 0 && goalItem.Status != goal.Completed {
+		if len(tasks) > 0 && len(completed) == len(tasks) {
+			return TurnResult{Goal: goalItem, Plan: plan, Executions: results, Tasks: tasks, Status: "awaiting_verification"}, nil
+		}
 		for _, item := range tasks {
 			if item.Status == task.Blocked || item.Status == task.WaitingApproval || item.Status == task.WaitingExternal || item.Status == task.Running || item.Status == task.Paused {
 				return TurnResult{Goal: goalItem, Plan: plan, Executions: results, Tasks: tasks, Status: string(goalItem.Status)}, nil

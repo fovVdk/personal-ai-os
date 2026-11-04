@@ -127,10 +127,15 @@ type Repository interface {
 }
 
 type Evidence struct {
-	Source      string
-	Description string
-	Reference   string
-	ObservedAt  time.Time
+	CriterionID      string
+	CriterionVersion int
+	Source           string
+	Description      string
+	Reference        string
+	ContentHash      string
+	VerifierType     string
+	VerifierVersion  string
+	ObservedAt       time.Time
 }
 
 type Executor interface {

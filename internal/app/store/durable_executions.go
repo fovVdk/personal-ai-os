@@ -329,6 +329,13 @@ func (s *DurableExecutionStore) Complete(ctx context.Context, lease execution.Le
 		return fmt.Errorf("begin execution completion: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	var goalID string
+	if err := tx.QueryRow(ctx, `SELECT t.goal_id::text FROM execution_runs e JOIN tasks t ON t.id=e.task_id WHERE e.id=$1`, lease.ExecutionID).Scan(&goalID); err != nil {
+		return fmt.Errorf("load durable execution Goal before completion: %w", err)
+	}
+	if err := lockGoalShared(ctx, tx, goalID); err != nil {
+		return fmt.Errorf("lock Goal before durable execution completion: %w", err)
+	}
 	var taskID, agentID string
 	err = tx.QueryRow(ctx, `UPDATE execution_runs SET status='succeeded',result=$4,completed_at=now(),worker_id=NULL,lease_until=NULL,
 		heartbeat_at=now(),failure_reason='',error_class='',state_reason='verified execution completed',state_changed_at=now(),updated_at=now()
@@ -347,7 +354,8 @@ func (s *DurableExecutionStore) Complete(ctx context.Context, lease execution.Le
 		if item.ObservedAt.IsZero() {
 			observedAt = time.Now().UTC()
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO execution_evidence(execution_run_id,source,description,reference,observed_at) VALUES($1,$2,$3,$4,$5)`, lease.ExecutionID, item.Source, item.Description, item.Reference, observedAt); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO execution_evidence(execution_run_id,source,description,reference,observed_at,criterion_id,criterion_version,content_hash,verifier_type,verifier_version)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, lease.ExecutionID, item.Source, item.Description, item.Reference, observedAt, item.CriterionID, item.CriterionVersion, item.ContentHash, item.VerifierType, item.VerifierVersion); err != nil {
 			return fmt.Errorf("persist execution evidence: %w", err)
 		}
 	}
@@ -359,17 +367,18 @@ func (s *DurableExecutionStore) Complete(ctx context.Context, lease execution.Le
 		return fmt.Errorf("complete task from execution: %w", execution.ErrLeaseLost)
 	}
 	var modelUsage struct {
-		ModelCalls   int  `json:"model_calls"`
-		ToolCalls    int  `json:"tool_calls"`
-		InputTokens  int  `json:"input_tokens"`
-		OutputTokens int  `json:"output_tokens"`
-		TotalTokens  int  `json:"total_tokens"`
-		Verified     bool `json:"verified"`
+		ModelCalls         int    `json:"model_calls"`
+		ToolCalls          int    `json:"tool_calls"`
+		InputTokens        int    `json:"input_tokens"`
+		OutputTokens       int    `json:"output_tokens"`
+		TotalTokens        int    `json:"total_tokens"`
+		Verified           bool   `json:"verified"`
+		VerificationMethod string `json:"verification_method"`
 	}
 	if err := json.Unmarshal(result, &modelUsage); err != nil {
 		return fmt.Errorf("decode execution model usage: %w", err)
 	}
-	if !modelUsage.Verified || modelUsage.ModelCalls < 0 || modelUsage.ToolCalls < 0 || modelUsage.InputTokens < 0 || modelUsage.OutputTokens < 0 || modelUsage.TotalTokens < modelUsage.InputTokens+modelUsage.OutputTokens {
+	if !modelUsage.Verified || strings.TrimSpace(modelUsage.VerificationMethod) == "" || modelUsage.ModelCalls < 0 || modelUsage.ToolCalls < 0 || modelUsage.InputTokens < 0 || modelUsage.OutputTokens < 0 || modelUsage.TotalTokens < modelUsage.InputTokens+modelUsage.OutputTokens {
 		return errors.New("execution result contains invalid model usage")
 	}
 	if modelUsage.ModelCalls > 0 || modelUsage.ToolCalls > 0 || modelUsage.TotalTokens > 0 {
@@ -757,7 +766,7 @@ func (s *DurableExecutionStore) ResumeApproval(ctx context.Context, userID, appr
 func (s *DurableExecutionStore) VerifiedTaskIDs(ctx context.Context, goalID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT e.task_id::text FROM execution_runs e JOIN tasks t ON t.id=e.task_id
 		JOIN execution_evidence evidence ON evidence.execution_run_id=e.id
-		WHERE t.goal_id=$1 AND e.status='succeeded' ORDER BY e.task_id::text`, goalID)
+		WHERE t.goal_id=$1 AND e.status='succeeded' AND COALESCE(e.result->>'verification_method','')<>'' ORDER BY e.task_id::text`, goalID)
 	if err != nil {
 		return nil, fmt.Errorf("list verified durable task executions: %w", err)
 	}

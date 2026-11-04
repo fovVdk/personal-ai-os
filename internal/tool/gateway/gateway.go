@@ -166,7 +166,16 @@ func (g *Gateway) Execute(ctx context.Context, request Request) (InvocationResul
 	}
 	callCtx, cancel := context.WithTimeout(ctx, definition.Timeout)
 	defer cancel()
-	output, callErr := registered.Handler.Execute(callCtx, canonical)
+	var output json.RawMessage
+	var callErr error
+	if contextual, ok := registered.Handler.(registry.ContextualHandler); ok {
+		output, callErr = contextual.ExecuteWithContext(callCtx, registry.InvocationContext{
+			GoalID: request.GoalID, TaskID: request.TaskID, ExecutionID: request.ExecutionID,
+			StepID: request.StepID, AgentID: request.AgentID,
+		}, canonical)
+	} else {
+		output, callErr = registered.Handler.Execute(callCtx, canonical)
+	}
 	if callErr != nil {
 		// A handler error does not prove that an external side effect did not happen.
 		if err := g.markUnknown(reservation, "tool handler returned an error; external outcome is uncertain"); err != nil {

@@ -20,6 +20,16 @@ func (f handlerFunc) Execute(ctx context.Context, args json.RawMessage) (json.Ra
 	return f(ctx, args)
 }
 
+type contextualTestHandler struct{ received registry.InvocationContext }
+
+func (h *contextualTestHandler) Execute(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return nil, errors.New("contextual execution path was not used")
+}
+func (h *contextualTestHandler) ExecuteWithContext(_ context.Context, call registry.InvocationContext, _ json.RawMessage) (json.RawMessage, error) {
+	h.received = call
+	return json.RawMessage(`{"value":"ok"}`), nil
+}
+
 type testAuthorizer struct{ decision policy.Decision }
 
 func (a testAuthorizer) Authorize(context.Context, Request, registry.Definition) (Authorization, error) {
@@ -151,5 +161,19 @@ func TestGatewayPersistsSuccessAndUnknownOutcomes(t *testing.T) {
 	result, err = gateway.Execute(context.Background(), validRequest())
 	if !errors.Is(err, ErrInvocationUnknown) || result.Status != "unknown" || store.unknown != 1 {
 		t.Fatalf("uncertain result=%+v err=%v unknown=%d", result, err, store.unknown)
+	}
+}
+
+func TestGatewayPassesOnlyValidatedInvocationIdentityToContextualHandler(t *testing.T) {
+	store := &testStore{reservation: Reservation{InvocationID: "inv-context", Status: "running"}}
+	handler := &contextualTestHandler{}
+	gateway, _ := buildGateway(t, policy.Allow, store, handler, nil)
+	request := validRequest()
+	if _, err := gateway.Execute(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	want := registry.InvocationContext{GoalID: request.GoalID, TaskID: request.TaskID, ExecutionID: request.ExecutionID, StepID: request.StepID, AgentID: request.AgentID}
+	if handler.received != want {
+		t.Fatalf("trusted invocation context=%+v, want %+v", handler.received, want)
 	}
 }

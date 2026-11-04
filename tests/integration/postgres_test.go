@@ -32,6 +32,7 @@ import (
 	"personal-ai-os/internal/memory"
 	"personal-ai-os/internal/node"
 	"personal-ai-os/internal/policy"
+	"personal-ai-os/internal/planner"
 	"personal-ai-os/internal/supervisor"
 	"personal-ai-os/internal/task"
 	toolgateway "personal-ai-os/internal/tool/gateway"
@@ -102,6 +103,12 @@ func TestPostgresMigrationsFromEmptyDatabaseAndIdempotency(t *testing.T) {
 		"0008_durable_execution_runtime.sql",
 		"0009_tool_fabric.sql",
 		"0010_goal_tool_usage.sql",
+		"0011_goal_evaluations.sql",
+		"0012_structured_goal_criteria.sql",
+		"0013_autonomy_records.sql",
+		"0014_goal_jobs.sql",
+		"0015_outbox_dispatch_leases.sql",
+		"0016_source_snapshots.sql",
 	}
 	rows, err := pool.Query(ctx, "SELECT version,checksum FROM schema_migrations ORDER BY version")
 	if err != nil {
@@ -139,11 +146,214 @@ func TestPostgresMigrationsFromEmptyDatabaseAndIdempotency(t *testing.T) {
 	t.Logf("pgvector extension version: %s", vectorVersion)
 	assertMigrationFailureRollsBack(t, ctx, pool, os.Getenv("PAIOS_TEST_DATABASE_URL"))
 
-	for _, index := range []string{"goals_owner_status_idx", "tasks_goal_status_idx", "execution_runs_recovery_idx", "memories_search_idx", "knowledge_chunks_search_idx", "nodes_status_type_idx", "tool_invocations_recovery_idx", "approvals_execution_context_idx"} {
+	for _, index := range []string{"goals_owner_status_idx", "tasks_goal_status_idx", "execution_runs_recovery_idx", "memories_search_idx", "knowledge_chunks_search_idx", "nodes_status_type_idx", "tool_invocations_recovery_idx", "approvals_execution_context_idx", "goal_evaluations_history_idx", "goals_structured_criteria_gin_idx", "criterion_verifications_current_idx", "plan_proposals_history_idx", "supervisor_decisions_history_idx", "goal_jobs_claim_idx", "goal_jobs_goal_history_idx", "event_outbox_dispatch_idx", "goal_job_wake_events_goal_idx", "source_snapshots_goal_history_idx", "source_snapshots_content_hash_idx", "source_references_artifact_idx", "source_references_snapshot_idx"} {
 		var exists bool
 		if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1)", index).Scan(&exists); err != nil || !exists {
 			t.Errorf("expected index %s, exists=%v err=%v", index, exists, err)
 		}
+	}
+}
+
+func TestPostgresGoalEvaluationPersistenceAndAudit(t *testing.T) {
+	pool, repository := integrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := migrations.Apply(ctx, pool); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	goalItem, err := repository.Create(ctx, goal.Goal{
+		OwnerID: testOwnerID, Title: uniqueLabel("evaluation-goal"), Description: "Evaluate persisted state",
+		Priority: 3, Status: goal.Active, UpdatedAt: time.Now().UTC(),
+		Criteria: []goal.SuccessCriterion{{
+			ID: "verified-sources", Name: "At least one cited research source", Type: goal.CriterionVerifiedEvidenceCount,
+			Required: true, ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence, MinEvidence: 1,
+			EvidenceSources: []string{"integration-verifier"}, RequireReference: true,
+			Source: goal.CriterionSourceUser, Confirmed: true, Version: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create Goal: %v", err)
+	}
+	evaluations := store.NewEvaluationStore(pool)
+	service := supervisor.Supervisor{
+		Goals: repository, Tasks: repository.Tasks(), Executions: store.NewExecutionStore(pool),
+		Evaluations: evaluations, Decisions: store.NewDecisionStore(pool), Usage: store.NewModelUsageStore(pool),
+		Budgets: supervisor.Budgets{MaxModelCalls: 10, MaxModelTokens: 10000, MaxToolCalls: 20},
+	}
+	taskItem, err := repository.Tasks().Create(ctx, task.Task{GoalID: goalItem.ID, Title: uniqueLabel("evaluation-task"), Priority: 3, Status: task.Created, CriterionIDs: []string{"verified-sources"}})
+	if err != nil {
+		t.Fatalf("create evaluation Task: %v", err)
+	}
+	for _, next := range []task.Status{task.Ready, task.Running, task.Completed} {
+		if _, err := repository.Tasks().Transition(ctx, taskItem.ID, next); err != nil {
+			t.Fatalf("transition evaluation Task to %s: %v", next, err)
+		}
+	}
+	_, err = store.NewExecutionStore(pool).Save(ctx, supervisor.Execution{
+		TaskID: taskItem.ID, AgentID: "integration-verifier", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "integration-test-verifier/v1",
+		Summary: "test fixture independently verified source evidence", CompletedAt: time.Now().UTC(),
+		Evidence: []supervisor.Evidence{{TaskID: taskItem.ID, CriterionID: "verified-sources", CriterionVersion: 1, Source: "integration-verifier", Description: "source record checked", Reference: "https://example.test/source"}},
+	})
+	if err != nil {
+		t.Fatalf("save verified execution evidence: %v", err)
+	}
+	loadedGoal, err := repository.Get(ctx, testOwnerID, goalItem.ID)
+	if err != nil || len(loadedGoal.Criteria) != 1 || loadedGoal.Criteria[0].ID != "verified-sources" || !loadedGoal.Criteria[0].Confirmed {
+		t.Fatalf("structured Goal criteria roundtrip=%+v err=%v", loadedGoal.Criteria, err)
+	}
+	evaluation, err := service.EvaluateGoal(ctx, goalItem.ID)
+	if err != nil {
+		t.Fatalf("evaluate Goal: %v", err)
+	}
+	if evaluation.ID == "" || evaluation.DecisionID == "" || evaluation.GoalID != goalItem.ID || evaluation.RecommendedAction != supervisor.ActionVerifyCompletion || len(evaluation.CompletedCriteria) != 1 || evaluation.CompletedCriteria[0].CriterionID != "verified-sources" || evaluation.CompletedCriteria[0].VerificationID == "" {
+		t.Fatalf("unexpected persisted evaluation: %+v", evaluation)
+	}
+	history, err := service.ListEvaluations(ctx, goalItem.ID, 10)
+	if err != nil || len(history) != 1 || history[0].ID != evaluation.ID || len(history[0].CompletedCriteria) != 1 || history[0].CompletedCriteria[0].Status != "satisfied" {
+		t.Fatalf("evaluation history=%+v err=%v", history, err)
+	}
+	var auditCount, outboxCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM audit_records WHERE resource='goal_evaluations' AND resource_id=$1", evaluation.ID).Scan(&auditCount); err != nil {
+		t.Fatalf("count evaluation audit records: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE aggregate_type='goal_evaluations' AND aggregate_id=$1", evaluation.ID).Scan(&outboxCount); err != nil {
+		t.Fatalf("count evaluation outbox records: %v", err)
+	}
+	if auditCount != 1 || outboxCount != 1 {
+		t.Fatalf("evaluation audit=%d outbox=%d, want one each", auditCount, outboxCount)
+	}
+	var verificationCount, linkedEvidence int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM criterion_verifications WHERE evaluation_id=$1 AND status='satisfied' AND criterion_version=1", evaluation.ID).Scan(&verificationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM criterion_verification_evidence link JOIN criterion_verifications v ON v.id=link.verification_id WHERE v.evaluation_id=$1", evaluation.ID).Scan(&linkedEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if verificationCount != 1 || linkedEvidence != 1 {
+		t.Fatalf("persisted criterion verifications=%d evidence links=%d", verificationCount, linkedEvidence)
+	}
+	decisions, err := service.ListDecisions(ctx, goalItem.ID, 10)
+	if err != nil || len(decisions) != 1 || decisions[0].ID != evaluation.DecisionID {
+		t.Fatalf("persisted Supervisor decisions=%+v err=%v", decisions, err)
+	}
+	secondEvaluation, err := service.EvaluateGoal(ctx, goalItem.ID)
+	if err != nil || secondEvaluation.DecisionID != evaluation.DecisionID {
+		t.Fatalf("repeated facts should reuse idempotent Decision; evaluation=%+v err=%v", secondEvaluation, err)
+	}
+	var decisionRows int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM supervisor_decisions WHERE goal_id=$1", goalItem.ID).Scan(&decisionRows); err != nil || decisionRows != 1 {
+		t.Fatalf("idempotent decision rows=%d err=%v, want 1", decisionRows, err)
+	}
+}
+
+func TestPostgresVersionedPlanProposalRetainsCompletedTasksAndRejectsStaleBase(t *testing.T) {
+	pool, repository := integrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := migrations.Apply(ctx, pool); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	goalItem, err := repository.Create(ctx, goal.Goal{OwnerID: testOwnerID, Title: uniqueLabel("versioned-plan-goal"), Priority: 3, Status: goal.Active, Criteria: []goal.SuccessCriterion{{
+		ID: "sources", Name: "Two source snapshots", Type: goal.CriterionVerifiedEvidenceCount, Required: true,
+		ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence, MinEvidence: 2,
+		Source: goal.CriterionSourceUser, Confirmed: true, Version: 1,
+	}}})
+	if err != nil {
+		t.Fatalf("create Goal: %v", err)
+	}
+	planStore := store.NewVersionedPlanStore(pool)
+	goalIDs := []string{goalItem.ID}
+	t.Cleanup(func() { cleanupIntegrationRows(t, context.Background(), pool, goalIDs, nil, nil, nil, nil, nil) })
+	initialPlan := planner.Plan{GoalID: goalItem.ID, Summary: "collect independent source evidence", Tasks: []planner.TaskSpec{{Key: "research", Title: "Collect source snapshots", Description: "Collect persisted source snapshots", CriterionIDs: []string{"sources"}, EvidenceRequirements: []string{"independently verified source records"}}}}
+	initial := planner.PlanProposal{GoalID: goalItem.ID, BasePlanVersion: 0, ProposedVersion: 1, Trigger: "initial", Reason: "initial Goal plan", Plan: initialPlan, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	if err := initial.Validate(goalItem.Criteria, 0, 10); err != nil {
+		t.Fatalf("validate initial proposal: %v", err)
+	}
+	initial, err = planStore.CreateProposal(ctx, initial)
+	if err != nil {
+		t.Fatalf("persist initial proposal: %v", err)
+	}
+	version1, err := planStore.AcceptProposal(ctx, goalItem.ID, initial.ID, 10)
+	if err != nil || version1.Version != 1 {
+		t.Fatalf("commit initial plan=%+v err=%v", version1, err)
+	}
+	tasks := repository.Tasks()
+	items, err := tasks.ListByGoal(ctx, goalItem.ID, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("initial Plan tasks=%+v err=%v", items, err)
+	}
+	completed := items[0]
+	for _, next := range []task.Status{task.Ready, task.Running, task.Completed} {
+		completed, err = tasks.Transition(ctx, completed.ID, next)
+		if err != nil {
+			t.Fatalf("transition retained Task to %s: %v", next, err)
+		}
+	}
+	revisedPlan := planner.Plan{GoalID: goalItem.ID, Summary: "preserve collected work and add a final source audit", Tasks: []planner.TaskSpec{
+		{Key: "research", Title: completed.Title, Description: completed.Description, CriterionIDs: []string{"sources"}, EvidenceRequirements: []string{"independently verified source records"}},
+		{Key: "source-audit", Title: "Audit source snapshots", Description: "Verify additional persisted source records", CriterionIDs: []string{"sources"}, EvidenceRequirements: []string{"two distinct verified evidence UUIDs"}, DependsOn: []string{"research"}},
+	}}
+	proposalA := planner.PlanProposal{GoalID: goalItem.ID, BasePlanVersion: 1, ProposedVersion: 2, Trigger: "insufficient_evidence", Reason: "need additional source evidence", RetainedTaskIDs: []string{completed.ID}, Plan: revisedPlan, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	if err := proposalA.Validate(goalItem.Criteria, 1, 10); err != nil {
+		t.Fatalf("validate revised Plan: %v", err)
+	}
+	proposalA, err = planStore.CreateProposal(ctx, proposalA)
+	if err != nil {
+		t.Fatalf("persist revised Plan Proposal: %v", err)
+	}
+	proposalB := proposalA
+	proposalB.ID = ""
+	proposalB.Plan.Summary = "concurrent stale proposal"
+	proposalB.Reason = "concurrent Planner result"
+	proposalB.Fingerprint, err = proposalB.ComputeFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposalB, err = planStore.CreateProposal(ctx, proposalB)
+	if err != nil {
+		t.Fatalf("persist concurrent proposal: %v", err)
+	}
+	version2, err := planStore.AcceptProposal(ctx, goalItem.ID, proposalA.ID, 10)
+	if err != nil || version2.Version != 2 {
+		t.Fatalf("accept revised proposal=%+v err=%v", version2, err)
+	}
+	if _, err := planStore.AcceptProposal(ctx, goalItem.ID, proposalB.ID, 10); !errors.Is(err, planner.ErrPlanConflict) {
+		t.Fatalf("stale concurrent proposal error=%v, want Plan conflict", err)
+	}
+	items, err = tasks.ListByGoal(ctx, goalItem.ID, 10)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("revised Plan task list=%+v err=%v", items, err)
+	}
+	var retained task.Task
+	for _, item := range items {
+		if item.ID == completed.ID {
+			retained = item
+		}
+	}
+	if retained.ID == "" || retained.Status != task.Completed || retained.AttemptCount != completed.AttemptCount {
+		t.Fatalf("completed Task was changed/re-executed by replanning: %+v", retained)
+	}
+	var activeVersions, supersededVersions int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FILTER(WHERE status='active'),count(*) FILTER(WHERE status='superseded') FROM plan_versions WHERE goal_id=$1", goalItem.ID).Scan(&activeVersions, &supersededVersions); err != nil || activeVersions != 1 || supersededVersions != 1 {
+		t.Fatalf("Plan history active=%d superseded=%d err=%v", activeVersions, supersededVersions, err)
+	}
+	var staleStatus string
+	if err := pool.QueryRow(ctx, "SELECT status FROM plan_proposals WHERE id=$1", proposalB.ID).Scan(&staleStatus); err != nil || staleStatus != "conflict" {
+		t.Fatalf("stale proposal status=%s err=%v", staleStatus, err)
+	}
+	proposalC := planner.PlanProposal{GoalID: goalItem.ID, BasePlanVersion: 2, ProposedVersion: 3, Trigger: "same_evidence", Reason: "no new task in this plan", Plan: revisedPlan, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	proposalC, err = planStore.CreateProposal(ctx, proposalC)
+	if err != nil {
+		t.Fatalf("persist no-progress proposal: %v", err)
+	}
+	if _, err := planStore.AcceptProposal(ctx, goalItem.ID, proposalC.ID, 10); !errors.Is(err, planner.ErrNoPlanProgress) {
+		t.Fatalf("no-progress Plan acceptance error=%v", err)
+	}
+	if _, err := planStore.GetCurrentPlan(ctx, goalItem.ID); err != nil {
+		t.Fatalf("no-progress rejection removed current Plan: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT status FROM plan_proposals WHERE id=$1", proposalC.ID).Scan(&staleStatus); err != nil || staleStatus != "rejected" {
+		t.Fatalf("no-progress proposal status=%s err=%v", staleStatus, err)
 	}
 }
 
@@ -280,10 +490,10 @@ func assertMigrationFailureRollsBack(t *testing.T, ctx context.Context, adminPoo
 		t.Fatalf("apply migrations after removing injected failure: %v", err)
 	}
 	var versionCount int
-	if err := migrationPool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versionCount); err != nil || versionCount != 10 {
-		t.Fatalf("successful retry migration count=%d err=%v, want 10", versionCount, err)
+	if err := migrationPool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versionCount); err != nil || versionCount != 16 {
+		t.Fatalf("successful retry migration count=%d err=%v, want 16", versionCount, err)
 	}
-	t.Log("injected migration failure rolled back both schema changes and version rows; clean retry applied all ten migrations")
+	t.Log("injected migration failure rolled back both schema changes and version rows; clean retry applied all sixteen migrations")
 }
 
 func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
@@ -308,7 +518,12 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 
 	createdGoal, err := repository.Create(ctx, goal.Goal{
 		OwnerID: testOwnerID, Title: uniqueLabel("postgres-goal"), Description: "db persistence check",
-		Priority: 4, Status: goal.Draft, SuccessCriteria: []string{"persist evidence"},
+		Priority: 4, Status: goal.Draft, Criteria: []goal.SuccessCriterion{{
+			ID: "database-evidence", Name: "Persist a cited database-backed evidence item", Type: goal.CriterionVerifiedEvidenceCount,
+			Required: true, ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence, MinEvidence: 1,
+			EvidenceSources: []string{"integration-test"}, RequireReference: true,
+			Source: goal.CriterionSourceUser, Confirmed: true, Version: 1,
+		}},
 	})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
@@ -365,8 +580,8 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	executions := store.NewExecutionStore(pool)
 	verifiedExecution := supervisor.Execution{
 		TaskID: createdTask.ID, AgentID: "integration-agent", Summary: "integration verified result",
-		Outcome: agentruntime.OutcomeSucceeded, ModelCalls: 1, InputTokens: 5, OutputTokens: 4, TotalTokens: 9,
-		Evidence: []supervisor.Evidence{{TaskID: createdTask.ID, Source: "integration-test", Description: "database-backed result evidence", ObservedAt: time.Now().UTC()}},
+		Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "integration-test-verifier/v1", ModelCalls: 1, InputTokens: 5, OutputTokens: 4, TotalTokens: 9,
+		Evidence: []supervisor.Evidence{{TaskID: createdTask.ID, Source: "integration-test", Description: "database-backed result evidence", Reference: "db://verified-evidence", ObservedAt: time.Now().UTC()}},
 		CompletedAt: time.Now().UTC(),
 	}
 	savedExecution, err := executions.Save(ctx, verifiedExecution)
@@ -617,22 +832,88 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 	verifyDurableClaimCheckpointFencing(t, ctx, pool, repository, createdGoal.ID, &taskIDs)
 
+	// Goal completion requires a fresh persisted Evaluation whose typed criterion is supported by verified execution evidence.
+	completionGoal, err := repository.Create(ctx, goal.Goal{
+		OwnerID: testOwnerID, Title: uniqueLabel("completion-gate-goal"), Priority: 3, Status: goal.Active,
+		Criteria: []goal.SuccessCriterion{{
+			ID: "completion-evidence", Name: "A verified cited result exists", Type: goal.CriterionVerifiedEvidenceCount,
+			Required: true, ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence, MinEvidence: 1,
+			EvidenceSources: []string{"completion-verifier"}, RequireReference: true,
+			Source: goal.CriterionSourceUser, Confirmed: true, Version: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create completion gate Goal: %v", err)
+	}
+	goalIDs = append(goalIDs, completionGoal.ID)
+	completionTask, err := tasks.Create(ctx, task.Task{GoalID: completionGoal.ID, Title: uniqueLabel("completion-gate-task"), Priority: 3, Status: task.Created, CriterionIDs: []string{"completion-evidence"}})
+	if err != nil {
+		t.Fatalf("create completion gate Task: %v", err)
+	}
+	taskIDs = append(taskIDs, completionTask.ID)
+	for _, next := range []task.Status{task.Ready, task.Running} {
+		if _, err := tasks.Transition(ctx, completionTask.ID, next); err != nil {
+			t.Fatalf("transition completion gate Task to %s: %v", next, err)
+		}
+	}
+	completionRun, err := executions.Save(ctx, supervisor.Execution{
+		TaskID: completionTask.ID, AgentID: "completion-verifier", Outcome: agentruntime.OutcomeSucceeded,
+		Verified: true, VerificationMethod: "integration-test-verifier/v1", CompletedAt: time.Now().UTC(),
+		Evidence: []supervisor.Evidence{{TaskID: completionTask.ID, CriterionID: "completion-evidence", CriterionVersion: 1, Source: "completion-verifier", Description: "independent check passed", Reference: "db://completion-evidence", ObservedAt: time.Now().UTC()}},
+	})
+	if err != nil {
+		t.Fatalf("save completion gate evidence: %v", err)
+	}
+	if _, err := tasks.Transition(ctx, completionTask.ID, task.Completed); err != nil {
+		t.Fatalf("complete completion gate Task: %v", err)
+	}
+	evaluationService := supervisor.Supervisor{
+		Goals: repository, Tasks: tasks, Executions: executions, Evaluations: store.NewEvaluationStore(pool), Decisions: store.NewDecisionStore(pool), Usage: store.NewModelUsageStore(pool),
+		Budgets: supervisor.Budgets{MaxModelCalls: 100, MaxModelTokens: 100000, MaxToolCalls: 100},
+	}
+	completionEvaluation, err := evaluationService.EvaluateGoal(ctx, completionGoal.ID)
+	if err != nil || completionEvaluation.RecommendedAction != supervisor.ActionVerifyCompletion || len(completionEvaluation.CompletedCriteria) != 1 {
+		t.Fatalf("evaluate completion criteria=%+v err=%v", completionEvaluation, err)
+	}
+	staleTask, err := tasks.Create(ctx, task.Task{GoalID: completionGoal.ID, Title: uniqueLabel("post-evaluation-task"), Priority: 1, Status: task.Created})
+	if err != nil {
+		t.Fatalf("create post-evaluation Task: %v", err)
+	}
+	taskIDs = append(taskIDs, staleTask.ID)
+	if _, err := repository.Transition(ctx, testOwnerID, completionGoal.ID, goal.Completed, []goal.Evidence{{Source: "caller-claim", Description: "stale evaluation must not pass", Reference: "model://claim"}}); !errors.Is(err, goal.ErrCriteriaUnverified) {
+		t.Fatalf("stale Evaluation completion error=%v, want criteria verification required", err)
+	}
+	completionEvaluation, err = evaluationService.EvaluateGoal(ctx, completionGoal.ID)
+	if err != nil || completionEvaluation.RecommendedAction != supervisor.ActionContinue {
+		t.Fatalf("refresh completion evaluation=%+v err=%v", completionEvaluation, err)
+	}
+	if _, err := tasks.Transition(ctx, staleTask.ID, task.Cancelled); err != nil {
+		t.Fatalf("cancel post-evaluation Task before final check: %v", err)
+	}
+	completionEvaluation, err = evaluationService.EvaluateGoal(ctx, completionGoal.ID)
+	if err != nil || completionEvaluation.RecommendedAction != supervisor.ActionVerifyCompletion {
+		goalTasks, _ := tasks.ListByGoal(ctx, completionGoal.ID, 20)
+		t.Fatalf("evaluate after cancelling unrelated Task=%+v tasks=%+v err=%v", completionEvaluation, goalTasks, err)
+	}
 	// Goal evidence and status transition commit atomically; retrieval includes persisted evidence.
-	completedGoal, err := repository.Transition(ctx, testOwnerID, createdGoal.ID, goal.Completed, []goal.Evidence{{Source: "integration-test", Description: "verified database record", Reference: "db://goal", ObservedAt: time.Now().UTC()}})
+	completedGoal, err := repository.Transition(ctx, testOwnerID, completionGoal.ID, goal.Completed, []goal.Evidence{{Source: "caller-claim", Description: "this untrusted request evidence must be ignored", Reference: "model://claim", ObservedAt: time.Now().UTC()}})
 	if err != nil || completedGoal.Progress != 100 || len(completedGoal.Evidence) != 1 {
 		t.Fatalf("complete Goal=%+v err=%v", completedGoal, err)
 	}
-	storedGoal, err := repository.Get(ctx, testOwnerID, createdGoal.ID)
+	if completedGoal.Evidence[0].Source != "structured-criterion-verifier" || !strings.Contains(completedGoal.Evidence[0].Reference, completionEvaluation.ID) || strings.Contains(completedGoal.Evidence[0].Reference, "model://claim") {
+		t.Fatalf("completion evidence did not derive from Evaluation: %+v", completedGoal.Evidence)
+	}
+	storedGoal, err := repository.Get(ctx, testOwnerID, completionGoal.ID)
 	if err != nil || storedGoal.Status != goal.Completed || len(storedGoal.Evidence) != 1 || storedGoal.CompletedAt == nil {
 		t.Fatalf("reloaded completed Goal=%+v err=%v", storedGoal, err)
 	}
 	var evidenceRows int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM goal_evidence WHERE goal_id=$1", createdGoal.ID).Scan(&evidenceRows); err != nil || evidenceRows != 1 {
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM goal_evidence WHERE goal_id=$1", completionGoal.ID).Scan(&evidenceRows); err != nil || evidenceRows != 1 {
 		t.Fatalf("goal evidence rows=%d err=%v", evidenceRows, err)
 	}
 
 	// Verify committed Goal/Task/Execution mutations have matching audit and outbox records.
-	for _, id := range []string{createdGoal.ID, createdTask.ID, savedExecution.ID} {
+	for _, id := range []string{createdGoal.ID, createdTask.ID, savedExecution.ID, completionGoal.ID, completionTask.ID, completionRun.ID} {
 		var outboxCount, auditCount int
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE aggregate_id=$1", id).Scan(&outboxCount); err != nil {
 			t.Fatal(err)
@@ -760,7 +1041,7 @@ func verifyDurableClaimCheckpointFencing(t *testing.T, ctx context.Context, pool
 	if err := durable.Start(ctx, newLease); err != nil {
 		t.Fatalf("start replacement claim: %v", err)
 	}
-	resultJSON := []byte(`{"summary":"fenced worker completion","verified":true}`)
+	resultJSON := []byte(`{"summary":"fenced worker completion","verified":true,"verification_method":"postgres-test-verifier/v1"}`)
 	evidence := []execution.Evidence{{Source: "phase10-integration", Description: "replacement worker evidence", ObservedAt: time.Now().UTC()}}
 	if err := durable.Complete(ctx, oldLease, resultJSON, evidence, true); !errors.Is(err, execution.ErrLeaseLost) {
 		t.Fatalf("stale worker completion error=%v", err)
@@ -845,9 +1126,12 @@ func TestPostgresPersistenceAcrossServerRestart(t *testing.T) {
 			t.Fatal("restart fixture already exists; run make test-integration to recreate the disposable test database")
 		}
 		var createdGoal goal.Goal
-		service.request(t, http.MethodPost, "/api/v1/goals", map[string]any{"title": goalTitle, "priority": 4, "success_criteria": []string{"survives database and Go service restart"}}, http.StatusCreated, &createdGoal)
+		service.request(t, http.MethodPost, "/api/v1/goals", map[string]any{"title": goalTitle, "priority": 4, "criteria": []map[string]any{{
+			"id": "restart-evidence", "name": "Restart fixture has verified evidence", "type": "verified_evidence_count", "required": true,
+			"validation_method": "verified_execution_evidence", "min_evidence": 1, "evidence_sources": []string{"restart-test"}, "require_reference": true,
+		}}}, http.StatusCreated, &createdGoal)
 		var createdTask task.Task
-		service.request(t, http.MethodPost, "/api/v1/tasks", map[string]any{"goal_id": createdGoal.ID, "title": "paios-restart-fixture-task", "priority": 3}, http.StatusCreated, &createdTask)
+		service.request(t, http.MethodPost, "/api/v1/tasks", map[string]any{"goal_id": createdGoal.ID, "title": "paios-restart-fixture-task", "priority": 3, "criterion_ids": []string{"restart-evidence"}}, http.StatusCreated, &createdTask)
 
 		tasks := repository.Tasks()
 		if _, err := tasks.Transition(ctx, createdTask.ID, task.Ready); err != nil {
@@ -858,8 +1142,8 @@ func TestPostgresPersistenceAcrossServerRestart(t *testing.T) {
 		}
 		executionStore := store.NewExecutionStore(pool)
 		if _, err := executionStore.Save(ctx, supervisor.Execution{
-			TaskID: createdTask.ID, AgentID: "restart-test", Summary: "persisted before PostgreSQL restart", Outcome: agentruntime.OutcomeSucceeded,
-			Evidence: []supervisor.Evidence{{TaskID: createdTask.ID, Source: "restart-test", Description: "execution evidence survived PostgreSQL restart", ObservedAt: time.Now().UTC()}},
+			TaskID: createdTask.ID, AgentID: "restart-test", Summary: "persisted before PostgreSQL restart", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "restart-test-verifier/v1",
+			Evidence: []supervisor.Evidence{{TaskID: createdTask.ID, CriterionID: "restart-evidence", CriterionVersion: 1, Source: "restart-test", Description: "execution evidence survived PostgreSQL restart", Reference: "test://restart-evidence", ObservedAt: time.Now().UTC()}},
 			CompletedAt: time.Now().UTC(),
 		}); err != nil {
 			t.Fatalf("persist restart execution: %v", err)
@@ -868,6 +1152,7 @@ func TestPostgresPersistenceAcrossServerRestart(t *testing.T) {
 			t.Fatalf("complete restart task: %v", err)
 		}
 		service.request(t, http.MethodPost, "/api/v1/goals/"+createdGoal.ID+"/activate", nil, http.StatusOK, nil)
+		service.request(t, http.MethodPost, "/api/v1/goals/"+createdGoal.ID+"/evaluate", map[string]any{}, http.StatusCreated, nil)
 		service.request(t, http.MethodPost, "/api/v1/goals/"+createdGoal.ID+"/complete", map[string]any{"evidence": []map[string]any{{"source": "restart-test", "description": "goal completion evidence", "reference": "test"}}}, http.StatusOK, &createdGoal)
 
 		var createdApproval approval.Request
@@ -1071,7 +1356,7 @@ func TestPostgresDurableWorkerPoolAndCancellationOutcome(t *testing.T) {
 	}
 	poolCtx, stopPool := context.WithCancel(context.Background())
 	poolService, err := execution.NewWorkerPool(durable, successfulTestExecutor{}, execution.WorkerConfig{
-		WorkerID: uniqueLabel("pool"), Concurrency: 2, LeaseDuration: time.Second, ExecutionTimeout: 5 * time.Second,
+		WorkerID: uniqueLabel("pool"), Concurrency: 2, LeaseDuration: 5 * time.Second, ExecutionTimeout: 5 * time.Second,
 		HeartbeatInterval: 100 * time.Millisecond, PollInterval: 10 * time.Millisecond, RetryBaseDelay: 10 * time.Millisecond,
 		RecoveryInterval: 100 * time.Millisecond, RecoveryBatch: 10, ShutdownGrace: time.Second,
 	}, nil)
@@ -1150,7 +1435,7 @@ func (successfulTestExecutor) Execute(ctx context.Context, run execution.Run, ch
 	if err := progress.SaveCheckpoint(ctx, execution.Checkpoint{StepID: "prepare", Progress: []byte(`{"ready":true}`), CompletedSteps: []string{"prepare"}, SchemaVersion: 1}); err != nil {
 		return execution.ExecutionResult{}, err
 	}
-	result, err := json.Marshal(supervisor.Execution{TaskID: run.TaskID, AgentID: run.AgentID, Summary: "worker complete", Outcome: agentruntime.OutcomeSucceeded, Verified: true, Evidence: []supervisor.Evidence{{TaskID: run.TaskID, Source: "worker-test", Description: "completed by durable worker", ObservedAt: time.Now().UTC()}}, CompletedAt: time.Now().UTC()})
+	result, err := json.Marshal(supervisor.Execution{TaskID: run.TaskID, AgentID: run.AgentID, Summary: "worker complete", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "postgres-test-verifier/v1", Evidence: []supervisor.Evidence{{TaskID: run.TaskID, Source: "worker-test", Description: "completed by durable worker", ObservedAt: time.Now().UTC()}}, CompletedAt: time.Now().UTC()})
 	if err != nil {
 		return execution.ExecutionResult{}, err
 	}
@@ -1217,6 +1502,28 @@ func waitForRecoveredTerminalRun(t *testing.T, ctx context.Context, pool *pgxpoo
 
 func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, goalIDs, taskIDs, memoryIDs, documentIDs, nodeIDs, approvalIDs []string) {
 	t.Helper()
+	if len(goalIDs) > 0 {
+		rows, err := pool.Query(ctx, "SELECT id::text FROM tasks WHERE goal_id::text=ANY($1::text[])", goalIDs)
+		if err != nil {
+			t.Errorf("list integration Goal tasks for cleanup: %v", err)
+			return
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				t.Errorf("scan integration Task for cleanup: %v", err)
+				return
+			}
+			taskIDs = append(taskIDs, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Errorf("iterate integration Tasks for cleanup: %v", err)
+			return
+		}
+		rows.Close()
+	}
 	allIDs := append([]string{}, goalIDs...)
 	allIDs = append(allIDs, taskIDs...)
 	allIDs = append(allIDs, memoryIDs...)
@@ -1229,9 +1536,39 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		return
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if len(goalIDs) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM goal_job_wake_events WHERE event_id IN (
+			SELECT id FROM event_outbox WHERE aggregate_type IN ('source_snapshots','source_references') AND aggregate_id IN (
+				SELECT id FROM source_snapshots WHERE goal_id::text=ANY($1::text[]) UNION SELECT id FROM source_references WHERE goal_id::text=ANY($1::text[])))`, goalIDs); err != nil {
+			t.Errorf("clean integration source wake receipts: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM event_outbox WHERE aggregate_type IN ('source_snapshots','source_references') AND aggregate_id IN (
+			SELECT id FROM source_snapshots WHERE goal_id::text=ANY($1::text[]) UNION SELECT id FROM source_references WHERE goal_id::text=ANY($1::text[]))`, goalIDs); err != nil {
+			t.Errorf("clean integration source outbox: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM audit_records WHERE resource IN ('source_snapshots','source_references') AND resource_id IN (
+			SELECT id::text FROM source_snapshots WHERE goal_id::text=ANY($1::text[]) UNION SELECT id::text FROM source_references WHERE goal_id::text=ANY($1::text[]))`, goalIDs); err != nil {
+			t.Errorf("clean integration source audit fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM source_references WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration source references: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM source_snapshots WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration source snapshots: %v", err)
+			return
+		}
+	}
 	if len(allIDs) > 0 {
 		if _, err := tx.Exec(ctx, "DELETE FROM audit_records WHERE resource_id=ANY($1::text[])", allIDs); err != nil {
 			t.Errorf("clean integration audit fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM goal_job_wake_events WHERE event_id IN (SELECT id FROM event_outbox WHERE aggregate_id::text=ANY($1::text[]))", allIDs); err != nil {
+			t.Errorf("clean integration Goal Job wake receipts: %v", err)
 			return
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM event_outbox WHERE aggregate_id=ANY($1::uuid[])", allIDs); err != nil {
@@ -1240,6 +1577,10 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 	}
 	if len(taskIDs) > 0 {
+		if _, err := tx.Exec(ctx, "DELETE FROM criterion_verification_evidence WHERE evidence_id IN (SELECT evidence.id FROM execution_evidence evidence JOIN execution_runs runs ON runs.id=evidence.execution_run_id WHERE runs.task_id::text=ANY($1::text[]))", taskIDs); err != nil {
+			t.Errorf("clean integration criterion evidence links: %v", err)
+			return
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM audit_records WHERE resource='tool_invocations' AND resource_id IN (SELECT id::text FROM tool_invocations WHERE task_id::text=ANY($1::text[]))`, taskIDs); err != nil {
 			t.Errorf("clean integration Tool invocation audit fixtures: %v", err)
 			return
@@ -1274,6 +1615,54 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 	}
 	if len(goalIDs) > 0 {
+		if _, err := tx.Exec(ctx, "DELETE FROM audit_records WHERE resource='goal_jobs' AND resource_id IN (SELECT id::text FROM goal_jobs WHERE goal_id::text=ANY($1::text[]))", goalIDs); err != nil {
+			t.Errorf("clean integration Goal Job audit: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM event_outbox WHERE aggregate_type='goal_jobs' AND aggregate_id IN (SELECT id FROM goal_jobs WHERE goal_id::text=ANY($1::text[]))", goalIDs); err != nil {
+			t.Errorf("clean integration Goal Job outbox: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM goal_job_wake_events WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration Goal Job wake events: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM goal_jobs WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration Goal Jobs: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM audit_records WHERE resource_id IN (SELECT id::text FROM supervisor_decisions WHERE goal_id::text=ANY($1::text[]) UNION SELECT id::text FROM plan_versions WHERE goal_id::text=ANY($1::text[]) UNION SELECT id::text FROM plan_proposals WHERE goal_id::text=ANY($1::text[]))", goalIDs); err != nil {
+			t.Errorf("clean integration autonomy audit fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM event_outbox WHERE aggregate_id IN (SELECT id FROM supervisor_decisions WHERE goal_id::text=ANY($1::text[]) UNION SELECT id FROM plan_versions WHERE goal_id::text=ANY($1::text[]) UNION SELECT id FROM plan_proposals WHERE goal_id::text=ANY($1::text[]))", goalIDs); err != nil {
+			t.Errorf("clean integration autonomy outbox fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM supervisor_decisions WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration Supervisor decisions: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM plan_proposals WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration Plan Proposals: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM plan_versions WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration Plan Versions: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM criterion_verification_evidence WHERE verification_id IN (SELECT id FROM criterion_verifications WHERE goal_id::text=ANY($1::text[]))", goalIDs); err != nil {
+			t.Errorf("clean integration criterion verification evidence: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM criterion_verifications WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration criterion verifications: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM goal_evaluations WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
+			t.Errorf("clean integration goal evaluations: %v", err)
+			return
+		}
 		if _, err := tx.Exec(ctx, "DELETE FROM goal_evidence WHERE goal_id::text=ANY($1::text[])", goalIDs); err != nil {
 			t.Errorf("clean integration goal evidence: %v", err)
 			return

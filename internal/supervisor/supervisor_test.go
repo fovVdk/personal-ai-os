@@ -157,7 +157,7 @@ func TestTurnRecoversEvidencePersistedBeforeTaskStatusCommit(t *testing.T) {
 	startedAt := time.Now().UTC()
 	storedTask := task.Task{ID: "task-recovery", GoalID: "goal-recovery", Title: "Already executed", Priority: 3, Status: task.Running, AttemptCount: 1, StartedAt: &startedAt}
 	taskRepo := &tasksRepo{items: []task.Task{storedTask}}
-	executions := &executionRepo{items: []Execution{{ID: "run-1", TaskID: storedTask.ID, AgentID: "planning", Summary: "done", Outcome: agentruntime.OutcomeSucceeded, Verified: true, Evidence: []Evidence{{TaskID: storedTask.ID, Source: "independent-verifier", Description: "verified"}}, CompletedAt: time.Now().UTC()}}}
+	executions := &executionRepo{items: []Execution{{ID: "run-1", TaskID: storedTask.ID, AgentID: "planning", Summary: "done", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "test-verifier/v1", Evidence: []Evidence{{TaskID: storedTask.ID, Source: "independent-verifier", Description: "verified"}}, CompletedAt: time.Now().UTC()}}}
 	agents := agentregistry.New()
 	if err := agents.Register(agentregistry.Profile{ID: "planning", Name: "Planning", Version: "mock-v1", Agent: agentruntime.MockAgent{AgentID: "planning"}}); err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestTurnRecoversEvidencePersistedBeforeTaskStatusCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Goal.Status != goal.Completed || taskRepo.items[0].Status != task.Completed || len(executions.items) != 1 {
+	if result.Goal.Status == goal.Completed || result.Status != "awaiting_verification" || taskRepo.items[0].Status != task.Completed || len(executions.items) != 1 {
 		t.Fatalf("recovery goal=%s task=%s runs=%d", result.Goal.Status, taskRepo.items[0].Status, len(executions.items))
 	}
 }

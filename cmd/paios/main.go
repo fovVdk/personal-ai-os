@@ -22,6 +22,7 @@ import (
 	"personal-ai-os/internal/app/config"
 	"personal-ai-os/internal/app/database"
 	"personal-ai-os/internal/app/store"
+	paievent "personal-ai-os/internal/event"
 	"personal-ai-os/internal/execution"
 	"personal-ai-os/internal/model/gateway"
 	"personal-ai-os/internal/model/provider"
@@ -33,6 +34,7 @@ import (
 	toolgateway "personal-ai-os/internal/tool/gateway"
 	toolmcp "personal-ai-os/internal/tool/mcp"
 	toolregistry "personal-ai-os/internal/tool/registry"
+	"personal-ai-os/internal/verification"
 	"personal-ai-os/migrations"
 )
 
@@ -80,11 +82,19 @@ func run() error {
 
 	repositories := store.NewPostgres(pool)
 	tools := toolregistry.New()
-	fileRoot := ""
-	if info, statErr := os.Stat(cfg.FileStorageDir); statErr == nil && info.IsDir() {
-		fileRoot = cfg.FileStorageDir
+	if err := os.MkdirAll(cfg.FileStorageDir, 0o700); err != nil {
+		return fmt.Errorf("create configured file storage root: %w", err)
 	}
-	if err := builtin.Register(tools, builtin.Options{FileRoot: fileRoot, OwnerID: store.LocalOwnerID, Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), HTTPFetchAllowedHosts: cfg.HTTPFetchAllowedHosts}); err != nil {
+	fileRoot := cfg.FileStorageDir
+	var artifactVerifier agentruntime.ResultVerifier
+	configuredVerifier, err := verification.NewArtifactVerifier(fileRoot, 8<<20)
+	if err != nil {
+		return fmt.Errorf("configure Core artifact verifier: %w", err)
+	}
+	configuredVerifier.Sources = repositories.Sources()
+	artifactVerifier = configuredVerifier
+	repositories.SetArtifactFreshnessVerifier(configuredVerifier)
+	if err := builtin.Register(tools, builtin.Options{FileRoot: fileRoot, OwnerID: store.LocalOwnerID, Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Sources: repositories.Sources(), HTTPFetchAllowedHosts: cfg.HTTPFetchAllowedHosts}); err != nil {
 		return fmt.Errorf("register built-in tools: %w", err)
 	}
 	mcpManager, err := toolmcp.NewManager(tools, toolmcp.Options{})
@@ -96,10 +106,14 @@ func run() error {
 	}
 	defer mcpManager.Close()
 	toolGrants := make(toolgateway.StaticGrants)
-	for _, toolID := range []string{"time.now", "filesystem.read", "filesystem.list", "memory.search", "knowledge.search", "http.fetch"} {
+	for _, toolID := range []string{"time.now", "filesystem.read", "filesystem.list", "memory.search", "knowledge.search", "http.fetch", "source.capture"} {
 		identity := toolregistry.Identity{ProviderID: "paios.native", ToolID: toolID, Version: "v1"}
 		if _, err := tools.Get(identity); err == nil {
-			toolGrants[identity.ProviderID+"/"+identity.ToolID+"@"+identity.Version] = toolgateway.Grant{Allowed: true, Autonomy: policy.A0}
+			autonomy := policy.A0
+			if toolID == "source.capture" {
+				autonomy = policy.A1
+			}
+			toolGrants[identity.ProviderID+"/"+identity.ToolID+"@"+identity.Version] = toolgateway.Grant{Allowed: true, Autonomy: autonomy}
 		}
 	}
 	toolGateway := &toolgateway.Gateway{Registry: tools, Authorizer: toolgateway.PolicyAuthorizer{Grants: configuredToolGrants{native: toolGrants, mcp: mcpManager}}, Leases: repositories, Store: repositories}
@@ -152,16 +166,30 @@ func run() error {
 		}
 	}
 	supervisorService := &supervisor.Supervisor{
-		Goals: repositories, Tasks: repositories.Tasks(), Planner: planGenerator, Agents: agents,
-		Executions: store.NewExecutionStore(pool), Usage: store.NewModelUsageStore(pool), Recovery: repositories,
+		Goals: repositories, Tasks: repositories.Tasks(), Planner: planGenerator, Agents: agents, Verifier: artifactVerifier,
+		Executions: store.NewExecutionStore(pool), Evaluations: store.NewEvaluationStore(pool), Decisions: store.NewDecisionStore(pool), Plans: store.NewVersionedPlanStore(pool), Usage: store.NewModelUsageStore(pool), Recovery: repositories,
 		Runtime: durableExecutions,
 		Budgets: supervisor.Budgets{MaxSteps: cfg.MaxAgentSteps, MaxModelCalls: cfg.MaxModelCalls, MaxToolCalls: cfg.MaxToolCalls, MaxModelTokens: cfg.MaxModelTokens, MaxCost: cfg.MaxExecutionCost, MaxRetries: cfg.MaxRetries, MaxRuntime: cfg.MaxExecutionTime},
+	}
+	goalJobStore := store.NewGoalJobStore(pool)
+	goalJobWorker := &supervisor.JobWorker{
+		Jobs: goalJobStore, Goals: repositories, Supervisor: supervisorService,
+		WorkerID: cfg.WorkerID + "-goal-runtime", Concurrency: cfg.WorkerCount,
+		LeaseDuration: cfg.WorkerLease, HeartbeatEvery: cfg.WorkerHeartbeat,
+		PollInterval: cfg.WorkerPoll, RetryBase: time.Second, MaxRetries: cfg.MaxRetries, MaxRuns: 100,
+		Logger: logger,
+	}
+	outboxDispatcher := &paievent.Dispatcher{
+		Repository: store.NewOutboxDispatcherStore(pool), WorkerID: cfg.WorkerID + "-outbox",
+		Concurrency: max(1, cfg.WorkerCount/2), BatchSize: 20, LeaseDuration: cfg.WorkerLease,
+		PollInterval: cfg.WorkerPoll, MaxAttempts: 12,
+		OnError: func(err error) { logger.Error("Outbox dispatcher cycle failed", "error", err) },
 	}
 	hostname, err := os.Hostname()
 	if err != nil || hostname == "" {
 		hostname = "local"
 	}
-	workerPool, err := execution.NewWorkerPool(durableExecutions, durableAgentExecutor{agents: agents, tools: toolGateway}, execution.WorkerConfig{
+	workerPool, err := execution.NewWorkerPool(durableExecutions, durableAgentExecutor{agents: agents, tools: toolGateway, verifier: artifactVerifier}, execution.WorkerConfig{
 		WorkerID: fmt.Sprintf("%s-%s-%d", cfg.WorkerID, hostname, os.Getpid()), Concurrency: cfg.WorkerCount,
 		LeaseDuration: cfg.WorkerLease, ExecutionTimeout: cfg.MaxExecutionTime, HeartbeatInterval: cfg.WorkerHeartbeat,
 		PollInterval: cfg.WorkerPoll, RetryBaseDelay: time.Second, RecoveryInterval: cfg.WorkerRecovery,
@@ -171,7 +199,7 @@ func run() error {
 		return fmt.Errorf("configure durable execution workers: %w", err)
 	}
 	handler := (&api.Server{
-		Goals: repositories, Tasks: repositories.Tasks(), Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Nodes: repositories.Nodes(), Approvals: repositories.Approvals(), Planner: planGenerator, Models: modelGateway, Agents: agents, Tools: tools, MCPServers: mcpManager, Supervisor: supervisorService, DB: pool,
+		Goals: repositories, Tasks: repositories.Tasks(), Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Sources: repositories.Sources(), Nodes: repositories.Nodes(), Approvals: repositories.Approvals(), Planner: planGenerator, Models: modelGateway, Agents: agents, Tools: tools, MCPServers: mcpManager, Supervisor: supervisorService, GoalJobs: goalJobStore, DB: pool,
 		WorkerStatus:      func() any { return workerPool.Snapshot() },
 		DurableExecutions: durableExecutions,
 		Logger:            logger, APIKey: cfg.APIKey, MaxRetries: cfg.MaxRetries, RequestTimeout: cfg.RequestTimeout,
@@ -188,6 +216,16 @@ func run() error {
 	go func() {
 		if err := workerPool.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.ErrorContext(ctx, "durable worker pool stopped unexpectedly", "error", err)
+		}
+	}()
+	go func() {
+		if err := goalJobWorker.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.ErrorContext(ctx, "Goal Job worker stopped unexpectedly", "error", err)
+		}
+	}()
+	go func() {
+		if err := outboxDispatcher.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.ErrorContext(ctx, "Outbox dispatcher stopped unexpectedly", "error", err)
 		}
 	}()
 	serverErr := make(chan error, 1)

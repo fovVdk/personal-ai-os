@@ -78,6 +78,110 @@ paths:
           description: Goal activated
         '409':
           description: Invalid transition
+  /api/v1/goals/{id}/evaluate:
+    post:
+      summary: Evaluate persisted Goal, Task, Evidence, and budget state
+      description: Returns a persisted conservative evaluation. Free-form success criteria remain unknown until independently verified; this endpoint never completes a Goal.
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '201':
+          description: Evaluation snapshot persisted
+        '404':
+          description: Goal not found
+  /api/v1/goals/{id}/evaluations:
+    get:
+      summary: List recent persisted Goal evaluations
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        '200':
+          description: Evaluation history
+        '404':
+          description: Goal not found
+  /api/v1/goals/{id}/decisions:
+    get:
+      summary: List persisted Supervisor decisions for a Goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Decision history
+        '404':
+          description: Goal not found
+  /api/v1/goals/{id}/plan:
+    get:
+      summary: Get the current committed Plan Version
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Current plan version
+        '404':
+          description: Goal or Plan not found
+  /api/v1/goals/{id}/plan/proposals:
+    get:
+      summary: List persisted Plan Proposals
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Proposal history
+  /api/v1/goals/{id}/replan:
+    post:
+      summary: Generate and persist a bounded Plan Proposal from the current Evaluation
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '201':
+          description: Plan Proposal persisted but not committed
+        '409':
+          description: Current evaluation does not recommend replanning or plan version changed
+  /api/v1/goals/{id}/plan-proposals/{proposalID}/accept:
+    post:
+      summary: Core-validate and atomically accept a Plan Proposal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: proposalID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: New Plan Version committed with Task additions
+        '404':
+          description: Goal or Proposal not found
+        '409':
+          description: Stale version conflict or expired proposal
+  /api/v1/goals/{id}/plan-proposals/{proposalID}/reject:
+    post:
+      summary: Reject a pending Plan Proposal with an audit reason
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: proposalID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: {type: string, minLength: 1, maxLength: 4000}
+      responses:
+        '200':
+          description: Proposal rejected and decision audited
+        '404':
+          description: Goal or Proposal not found
   /api/v1/goals/{id}/pause:
     post:
       summary: Pause a goal
@@ -94,6 +198,139 @@ paths:
       responses:
         '200':
           description: Goal resumed
+  /api/v1/goals/{id}/jobs:
+    post:
+      summary: Create or wake the persistent autonomous Goal Job
+      description: Creates one durable background Job for this Goal or coalesces a wake signal into its existing Job. It does not execute the Supervisor turn in the HTTP request.
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '202':
+          description: Goal Job queued or wake requested
+        '404':
+          description: Goal not found
+        '409':
+          description: Goal is not eligible for autonomous execution
+    get:
+      summary: List persistent Goal Job history
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Goal Job history
+  /api/v1/goal-jobs/{jobID}:
+    get:
+      summary: Get a persistent Goal Job
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Goal Job state, lease, retry and run counters
+        '404':
+          description: Goal Job not found
+  /api/v1/goal-jobs/{jobID}/pause:
+    post:
+      summary: Pause a Goal Job and fence any current Worker
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Goal Job paused
+        '404':
+          description: Goal Job not found
+  /api/v1/goal-jobs/{jobID}/resume:
+    post:
+      summary: Resume a paused Goal Job
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Goal Job resumed
+        '409':
+          description: Goal Job is not paused or its Goal is not eligible
+  /api/v1/goal-jobs/{jobID}/cancel:
+    post:
+      summary: Cancel a Goal Job and fence any current Worker
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Goal Job cancelled
+        '404':
+          description: Goal Job not found
+  /api/v1/goals/{id}/sources:
+    get:
+      summary: List immutable source snapshots for a Goal
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Snapshot metadata and normalized content; raw bytes remain stored for re-verification
+        '404':
+          description: Goal not found
+  /api/v1/goals/{id}/sources/{sourceID}:
+    get:
+      summary: Get an immutable source snapshot
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: sourceID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Source snapshot
+        '404':
+          description: Goal or source snapshot not found
+  /api/v1/goals/{id}/source-references:
+    post:
+      summary: Bind a report citation and exact quote to a source snapshot
+      description: URL and quote are checked against the immutable snapshot. Semantic support remains unverified until independent review.
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, source_id, artifact_path, url, quote]
+              properties:
+                task_id: {type: string, format: uuid}
+                source_id: {type: string, format: uuid}
+                artifact_path: {type: string, maxLength: 1024}
+                url: {type: string, format: uri}
+                quote: {type: string, minLength: 1, maxLength: 8000}
+      responses:
+        '201':
+          description: Immutable reference binding created with deterministic verification result
+        '400':
+          description: URL, quote, task, or artifact path does not match the snapshot
+        '404':
+          description: Goal, Task, or source snapshot not found
+    get:
+      summary: List citation bindings for an artifact
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: artifact_path
+          in: query
+          required: true
+          schema: {type: string, maxLength: 1024}
+      responses:
+        '200':
+          description: Persisted citation bindings
   /api/v1/goals/{id}/complete:
     post:
       summary: Complete a goal with verifiable evidence
@@ -121,7 +358,7 @@ paths:
         '200':
           description: Goal completed
         '422':
-          description: Evidence required
+          description: Evidence is missing or the current Evaluation does not satisfy every required structured criterion
   /api/v1/tasks:
     post:
       summary: Create a task attached to a goal
@@ -557,7 +794,16 @@ components:
         description: {type: string}
         parent_goal_id: {type: [string, 'null'], format: uuid}
         priority: {type: integer, minimum: 1, maximum: 5, default: 3}
-        success_criteria: {type: array, items: {type: string}}
+        success_criteria:
+          type: array
+          deprecated: true
+          description: Legacy free-form criteria; retained for compatibility and cannot be verified automatically.
+          items: {type: string}
+        criteria:
+          type: array
+          description: User-confirmed structured acceptance criteria. At least one criterion must be required; cannot be combined with legacy success_criteria.
+          items:
+            $ref: '#/components/schemas/SuccessCriterion'
         constraints: {type: array, items: {type: string}}
     GoalPatch:
       type: object
@@ -567,8 +813,67 @@ components:
         title: {type: string, minLength: 1}
         description: {type: string}
         priority: {type: integer, minimum: 1, maximum: 5}
-        success_criteria: {type: array, items: {type: string}}
+        success_criteria:
+          type: array
+          deprecated: true
+          description: Legacy free-form criteria; retained for compatibility and cannot be verified automatically.
+          items: {type: string}
+        criteria:
+          type: array
+          description: Replaces the structured acceptance criteria, clears legacy success_criteria, and increments versions for matching IDs. At least one criterion must be required.
+          items:
+            $ref: '#/components/schemas/SuccessCriterion'
         constraints: {type: array, items: {type: string}}
+    SuccessCriterion:
+      type: object
+      additionalProperties: false
+      required: [id, name, type, required, validation_method]
+      properties:
+        id: {type: string, minLength: 1, maxLength: 128}
+        name: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 4000}
+        type:
+          type: string
+          enum: [verified_evidence_count, verified_task_completion, artifact_exists, markdown_structure]
+        required: {type: boolean}
+        validation_method:
+          type: string
+          enum: [verified_execution_evidence, artifact_in_file_storage]
+        min_evidence: {type: integer, minimum: 1, maximum: 10000}
+        evidence_sources:
+          type: array
+          items: {type: string, minLength: 1}
+        require_reference: {type: boolean}
+        task_ids:
+          type: array
+          maxItems: 200
+          items: {type: string, minLength: 1}
+        artifact_path:
+          type: string
+          maxLength: 1024
+          description: Relative file path under FILE_STORAGE_DIR; absolute paths and traversal are rejected.
+        required_sections:
+          type: array
+          maxItems: 32
+          items: {type: string, minLength: 1}
+        max_artifact_bytes: {type: integer, minimum: 1, maximum: 67108864}
+        source:
+          type: string
+          readOnly: true
+          description: Set by Core to user for API-provided criteria.
+        confirmed:
+          type: boolean
+          readOnly: true
+          description: Set by Core after the authenticated owner submits criteria.
+        version:
+          type: integer
+          minimum: 1
+          readOnly: true
+          description: Managed by Core; increments when an existing criterion is revised.
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
     TaskInput:
       type: object
       additionalProperties: false
@@ -579,6 +884,10 @@ components:
         description: {type: string}
         priority: {type: integer, minimum: 1, maximum: 5, default: 3}
         success_criteria: {type: array, items: {type: string}}
+        criterion_ids:
+          type: array
+          description: Unique Criterion IDs declared by the referenced Goal; Core rejects unknown or duplicate IDs.
+          items: {type: string, minLength: 1, maxLength: 128}
     MemoryInput:
       type: object
       additionalProperties: false

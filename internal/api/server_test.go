@@ -153,6 +153,34 @@ func (m *memoryExecutions) Save(_ context.Context, item supervisor.Execution) (s
 func (m *memoryExecutions) ListByGoal(_ context.Context, _ string) ([]supervisor.Execution, error) {
 	return append([]supervisor.Execution(nil), m.items...), nil
 }
+
+type memoryEvaluations struct{ items []supervisor.Evaluation }
+
+func (m *memoryEvaluations) SaveEvaluation(_ context.Context, item supervisor.Evaluation) (supervisor.Evaluation, error) {
+	item.ID = fmt.Sprintf("evaluation-%d", len(m.items)+1)
+	m.items = append(m.items, item)
+	return item, nil
+}
+
+type memoryDecisions struct{ items []supervisor.Decision }
+
+func (m *memoryDecisions) SaveDecision(_ context.Context, item supervisor.Decision) (supervisor.Decision, error) {
+	item.ID = fmt.Sprintf("decision-%d", len(m.items)+1)
+	m.items = append(m.items, item)
+	return item, nil
+}
+func (m *memoryDecisions) ListDecisions(_ context.Context, _ string, limit int) ([]supervisor.Decision, error) {
+	if limit < len(m.items) {
+		return append([]supervisor.Decision(nil), m.items[:limit]...), nil
+	}
+	return append([]supervisor.Decision(nil), m.items...), nil
+}
+func (m *memoryEvaluations) ListEvaluations(_ context.Context, _ string, limit int) ([]supervisor.Evaluation, error) {
+	if limit < len(m.items) {
+		return append([]supervisor.Evaluation(nil), m.items[:limit]...), nil
+	}
+	return append([]supervisor.Evaluation(nil), m.items...), nil
+}
 func (m *memoryApprovals) ListPending(_ context.Context, userID string, _ int) ([]approval.Request, error) {
 	items := make([]approval.Request, 0)
 	for _, item := range m.items {
@@ -217,6 +245,62 @@ func TestGoalAndTaskAPIFlow(t *testing.T) {
 	}
 }
 
+func TestCreateGoalConfirmsTypedCriteriaAsUserAuthored(t *testing.T) {
+	goals := &memoryGoals{items: map[string]goal.Goal{}}
+	handler := (&Server{Goals: goals, Tasks: &memoryTasks{items: map[string]task.Task{}}}).Handler()
+	body := `{"title":"Research goal","criteria":[{"id":"sources","name":"Two cited sources","description":"At least two independent references","type":"verified_evidence_count","required":true,"validation_method":"verified_execution_evidence","min_evidence":2,"evidence_sources":["research"],"require_reference":true,"source":"model","confirmed":false,"version":1}]}`
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/goals", strings.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create Goal status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created goal.Goal
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.Criteria) != 1 || created.Criteria[0].Source != goal.CriterionSourceUser || !created.Criteria[0].Confirmed {
+		t.Fatalf("API did not stamp owner-confirmed criterion provenance: %+v", created.Criteria)
+	}
+	patch := httptest.NewRecorder()
+	handler.ServeHTTP(patch, httptest.NewRequest(http.MethodPatch, "/api/v1/goals/"+created.ID, strings.NewReader(`{"criteria":[{"id":"sources","name":"Three cited sources","type":"verified_evidence_count","required":true,"validation_method":"verified_execution_evidence","min_evidence":3}]}`)))
+	if patch.Code != http.StatusOK || goals.items[created.ID].Criteria[0].Version != 2 || goals.items[created.ID].Criteria[0].Name != "Three cited sources" {
+		t.Fatalf("criteria update must create a new version: status=%d body=%s criterion=%+v", patch.Code, patch.Body.String(), goals.items[created.ID].Criteria[0])
+	}
+	bad := httptest.NewRecorder()
+	handler.ServeHTTP(bad, httptest.NewRequest(http.MethodPost, "/api/v1/goals", strings.NewReader(`{"title":"Bad criteria","criteria":[{"id":"x","name":"Unsupported","type":"llm_says_done","required":true,"validation_method":"llm_confidence"}]}`)))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported criterion status=%d body=%s", bad.Code, bad.Body.String())
+	}
+}
+
+func TestGoalEvaluationAPIAndHistory(t *testing.T) {
+	now := time.Now().UTC()
+	goals := &memoryGoals{items: map[string]goal.Goal{
+		"goal-evaluation": {ID: "goal-evaluation", OwnerID: defaultOwnerID, Title: "Evaluate", Priority: 3, Status: goal.Active, SuccessCriteria: []string{"criterion"}, UpdatedAt: now},
+	}}
+	evaluations := &memoryEvaluations{}
+	supervisorService := &supervisor.Supervisor{
+		Goals: goals, Tasks: &memoryTasks{items: map[string]task.Task{}}, Executions: &memoryExecutions{}, Evaluations: evaluations, Decisions: &memoryDecisions{},
+		Budgets: supervisor.Budgets{MaxModelCalls: 5, MaxModelTokens: 1000, MaxToolCalls: 5},
+	}
+	handler := (&Server{Goals: goals, Supervisor: supervisorService}).Handler()
+	post := httptest.NewRecorder()
+	handler.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/api/v1/goals/goal-evaluation/evaluate", nil))
+	if post.Code != http.StatusCreated || !strings.Contains(post.Body.String(), `"evaluation_status":"in_progress"`) || !strings.Contains(post.Body.String(), `"completion_percentage":null`) {
+		t.Fatalf("evaluate status=%d body=%s", post.Code, post.Body.String())
+	}
+	get := httptest.NewRecorder()
+	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/v1/goals/goal-evaluation/evaluations?limit=1", nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"evaluation_id":"evaluation-1"`) {
+		t.Fatalf("history status=%d body=%s", get.Code, get.Body.String())
+	}
+	invalidLimit := httptest.NewRecorder()
+	handler.ServeHTTP(invalidLimit, httptest.NewRequest(http.MethodGet, "/api/v1/goals/goal-evaluation/evaluations?limit=101", nil))
+	if invalidLimit.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status=%d body=%s", invalidLimit.Code, invalidLimit.Body.String())
+	}
+}
+
 func TestRejectsUnknownJSONFields(t *testing.T) {
 	handler := (&Server{Goals: &memoryGoals{items: map[string]goal.Goal{}}, Tasks: &memoryTasks{items: map[string]task.Task{}}}).Handler()
 	response := httptest.NewRecorder()
@@ -236,7 +320,7 @@ func TestRejectsOversizedRequestBody(t *testing.T) {
 	}
 }
 
-func TestGoalCompletionRequiresEvidence(t *testing.T) {
+func TestGoalCompletionRequiresEvidenceAndTypedCriteria(t *testing.T) {
 	goals := &memoryGoals{items: map[string]goal.Goal{}}
 	handler := (&Server{Goals: goals, Tasks: &memoryTasks{items: map[string]task.Task{}}}).Handler()
 	create := httptest.NewRecorder()
@@ -257,8 +341,35 @@ func TestGoalCompletionRequiresEvidence(t *testing.T) {
 	}
 	complete = httptest.NewRecorder()
 	handler.ServeHTTP(complete, httptest.NewRequest(http.MethodPost, "/api/v1/goals/"+item.ID+"/complete", strings.NewReader(`{"evidence":[{"source":"test","description":"verified"}]}`)))
-	if complete.Code != http.StatusOK {
-		t.Fatalf("complete with evidence status=%d body=%s", complete.Code, complete.Body.String())
+	if complete.Code != http.StatusConflict || !strings.Contains(complete.Body.String(), "criteria_unverified") {
+		t.Fatalf("legacy free-text goal must not complete with arbitrary evidence: status=%d body=%s", complete.Code, complete.Body.String())
+	}
+}
+
+func TestGoalCompletionRequiresSatisfiedTypedCriteria(t *testing.T) {
+	now := time.Now().UTC()
+	criterion := goal.SuccessCriterion{
+		ID: "sources", Name: "One cited source", Type: goal.CriterionVerifiedEvidenceCount,
+		Required: true, ValidationMethod: goal.CriterionMethodVerifiedExecutionEvidence,
+		MinEvidence: 1, EvidenceSources: []string{"independent-check"}, RequireReference: true,
+		Source: goal.CriterionSourceUser, Confirmed: true, Version: 1,
+	}
+	goals := &memoryGoals{items: map[string]goal.Goal{
+		"goal-verified": {ID: "goal-verified", OwnerID: defaultOwnerID, Title: "Goal", Priority: 3, Status: goal.Active, UpdatedAt: now, Criteria: []goal.SuccessCriterion{criterion}},
+	}}
+	tasks := &memoryTasks{items: map[string]task.Task{
+		"task-verified": {ID: "task-verified", GoalID: "goal-verified", Title: "Collect source", Priority: 3, Status: task.Completed, CriterionIDs: []string{"sources"}},
+	}}
+	executions := &memoryExecutions{items: []supervisor.Execution{{
+		TaskID: "task-verified", Outcome: agentruntime.OutcomeSucceeded, Verified: true, VerificationMethod: "api-test-verifier/v1",
+		Evidence: []supervisor.Evidence{{EvidenceID: "evidence-verified", TaskID: "task-verified", CriterionID: "sources", CriterionVersion: 1, Source: "independent-check", Description: "citation checked", Reference: "https://example.test/source"}},
+	}}}
+	service := &supervisor.Supervisor{Goals: goals, Tasks: tasks, Executions: executions, Evaluations: &memoryEvaluations{}, Decisions: &memoryDecisions{}, Budgets: supervisor.Budgets{MaxModelCalls: 10, MaxModelTokens: 1000, MaxToolCalls: 10}}
+	handler := (&Server{Goals: goals, Tasks: tasks, Supervisor: service}).Handler()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/goals/goal-verified/complete", strings.NewReader(`{"evidence":[{"source":"Core verifier","description":"typed criterion evidence passed"}]}`)))
+	if response.Code != http.StatusOK || goals.items["goal-verified"].Status != goal.Completed {
+		t.Fatalf("verified completion status=%d body=%s goal=%+v", response.Code, response.Body.String(), goals.items["goal-verified"])
 	}
 }
 

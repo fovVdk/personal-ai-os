@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -20,8 +21,9 @@ import (
 )
 
 type durableAgentExecutor struct {
-	agents *registry.Registry
-	tools  *toolgateway.Gateway
+	agents   *registry.Registry
+	tools    *toolgateway.Gateway
+	verifier agentruntime.ResultVerifier
 }
 
 func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, checkpoint *execution.Checkpoint, progress execution.Progress) (execution.ExecutionResult, error) {
@@ -68,30 +70,37 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 	if observedCalls := int(toolCaller.calls.Load()); observedCalls > result.ToolCalls {
 		result.ToolCalls = observedCalls
 	}
-	if result.Outcome != agentruntime.OutcomeSucceeded || !result.Verified || result.Steps < 1 || result.Steps > request.MaxSteps || len(result.Evidence) == 0 {
+	if result.Outcome != agentruntime.OutcomeSucceeded || result.Steps < 1 || result.Steps > request.MaxSteps {
 		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailurePermanent, Err: supervisor.ErrUnverifiedResult}
 	}
 	if result.ModelCalls < 0 || result.ToolCalls < 0 || result.ModelTokens < result.InputTokens+result.OutputTokens || result.InputTokens < 0 || result.OutputTokens < 0 || result.ModelTokens > request.MaxTokens || result.ModelCalls > request.MaxModelCalls || result.ToolCalls > request.MaxToolCalls || result.Cost < 0 || math.IsNaN(result.Cost) || math.IsInf(result.Cost, 0) || request.MaxCost > 0 && result.Cost > request.MaxCost {
 		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailurePermanent, Err: errors.New("Agent result exceeded persisted execution budget")}
 	}
+	if e.verifier == nil {
+		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailurePermanent, Err: supervisor.ErrUnverifiedResult}
+	}
+	verification, err := e.verifier.Verify(ctx, request, result)
+	if err != nil || !verification.Verified || strings.TrimSpace(verification.Method) == "" || len(verification.Evidence) == 0 {
+		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailurePermanent, Err: supervisor.ErrUnverifiedResult}
+	}
 	completedAt := time.Now().UTC()
 	if !request.Deadline.IsZero() && completedAt.After(request.Deadline) {
 		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailureUncertain, Err: context.DeadlineExceeded}
 	}
-	evidence := make([]execution.Evidence, 0, len(result.Evidence))
-	supervisorEvidence := make([]supervisor.Evidence, 0, len(result.Evidence))
-	for _, item := range result.Evidence {
-		evidence = append(evidence, execution.Evidence{Source: item.Source, Description: item.Description, Reference: item.Reference, ObservedAt: completedAt})
-		supervisorEvidence = append(supervisorEvidence, supervisor.Evidence{TaskID: run.TaskID, Source: item.Source, Description: item.Description, Reference: item.Reference, ObservedAt: completedAt})
+	evidence := make([]execution.Evidence, 0, len(verification.Evidence))
+	supervisorEvidence := make([]supervisor.Evidence, 0, len(verification.Evidence))
+	for _, item := range verification.Evidence {
+		evidence = append(evidence, execution.Evidence{CriterionID: item.CriterionID, CriterionVersion: item.CriterionVersion, Source: item.Source, Description: item.Description, Reference: item.Reference, ContentHash: item.ContentHash, VerifierType: item.VerifierType, VerifierVersion: item.VerifierVersion, ObservedAt: completedAt})
+		supervisorEvidence = append(supervisorEvidence, supervisor.Evidence{TaskID: run.TaskID, CriterionID: item.CriterionID, CriterionVersion: item.CriterionVersion, Source: item.Source, Description: item.Description, Reference: item.Reference, ContentHash: item.ContentHash, VerifierType: item.VerifierType, VerifierVersion: item.VerifierVersion, ObservedAt: completedAt})
 	}
 	output := supervisor.Execution{ID: run.ID, TaskID: run.TaskID, AgentID: profile.ID, Summary: result.Summary, Outcome: result.Outcome,
 		InputTokens: result.InputTokens, OutputTokens: result.OutputTokens, TotalTokens: result.ModelTokens, ModelCalls: result.ModelCalls,
-		ToolCalls: result.ToolCalls, Evidence: supervisorEvidence, CompletedAt: completedAt, Verified: result.Verified}
+		ToolCalls: result.ToolCalls, Evidence: supervisorEvidence, CompletedAt: completedAt, Verified: true, VerificationMethod: verification.Method}
 	encoded, err := json.Marshal(output)
 	if err != nil {
 		return execution.ExecutionResult{}, fmt.Errorf("encode durable Agent result: %w", err)
 	}
-	return execution.ExecutionResult{Result: encoded, Evidence: evidence, VerifiedResult: result.Verified}, nil
+	return execution.ExecutionResult{Result: encoded, Evidence: evidence, VerifiedResult: true}, nil
 }
 
 type durableToolCaller struct {

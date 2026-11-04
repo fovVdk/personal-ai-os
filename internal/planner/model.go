@@ -14,7 +14,7 @@ import (
 	"personal-ai-os/internal/model/gateway"
 )
 
-const systemPrompt = `Create a safe, practical plan for the user's goal. Return only JSON matching this schema: {"goal_id":"...","summary":"...","estimated_hours":1,"risks":["..."],"tasks":[{"key":"stable-key","title":"...","description":"...","success_criteria":["..."],"depends_on":["other-key"],"estimated_hours":1,"risks":["..."]}]}. Do not claim that actions have already been performed. Keep external side effects out of the plan; describe work for human review.`
+const systemPrompt = `Create a safe, practical plan for the user's goal. Treat supplied structured success criteria as acceptance requirements. Map each required criterion to one or more task criterion_ids and state evidence_requirements. Preserve every supplied existing Task with the exact same key, title, description, criterion_ids and dependency relationships; never omit, reset, or claim to modify a completed, running, approval-waiting, or external-waiting Task. Add new stable-key Tasks only for concrete unmet criteria or explicit recovery work. Do not invent that criteria are already satisfied. Return only JSON matching this schema: {"goal_id":"...","summary":"...","estimated_hours":1,"risks":["..."],"tasks":[{"key":"stable-key","title":"...","description":"...","success_criteria":["..."],"criterion_ids":["criterion-id"],"evidence_requirements":["persisted evidence needed"],"depends_on":["other-key"],"estimated_hours":1,"risks":["..."]}]}. Use only criterion IDs supplied by Core. Do not claim actions have already been performed. Keep external side effects out of the plan; describe work for human review.`
 
 type ModelGenerator struct {
 	Gateway gateway.Gateway

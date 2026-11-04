@@ -1,5 +1,3 @@
-// English: These tests exercise built-in read-only Tools and filesystem/SSRF security boundaries.
-// 中文：本测试验证内置只读工具以及文件路径和 SSRF 防护边界。
 package builtin
 
 import (
@@ -13,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"personal-ai-os/internal/source"
 	"personal-ai-os/internal/tool/registry"
 )
 
@@ -32,6 +31,57 @@ func TestTimeNowToolReturnsUTC(t *testing.T) {
 	}
 	if !strings.Contains(string(result), "2026-01-02T02:04:05Z") {
 		t.Fatalf("time result=%s", result)
+	}
+}
+
+type testSourceFetcher struct{ snapshot source.Snapshot }
+
+func (f testSourceFetcher) Fetch(context.Context, string) (source.Snapshot, error) {
+	return f.snapshot, nil
+}
+
+type captureRepository struct{ snapshot source.Snapshot }
+
+func (r *captureRepository) Create(_ context.Context, item source.Snapshot) (source.Snapshot, error) {
+	item.ID = "persisted-source"
+	r.snapshot = item
+	return item, nil
+}
+func (r *captureRepository) Get(context.Context, string, string, string) (source.Snapshot, error) {
+	return r.snapshot, nil
+}
+func (r *captureRepository) List(context.Context, string, string, int) ([]source.Snapshot, error) {
+	return []source.Snapshot{r.snapshot}, nil
+}
+func (r *captureRepository) AddReference(context.Context, source.Reference) (source.Reference, error) {
+	return source.Reference{}, nil
+}
+func (r *captureRepository) ListReferences(context.Context, string, string, string) ([]source.Reference, error) {
+	return nil, nil
+}
+
+func TestSourceCaptureUsesGatewayContextAndPersistsAllowlistedSource(t *testing.T) {
+	const sourceURL = "https://research.example/source"
+	content := []byte("A captured source sentence.")
+	repository := &captureRepository{}
+	handler := sourceCapture{ownerID: "owner", fetcher: testSourceFetcher{snapshot: source.Snapshot{
+		OriginalURL: sourceURL, FinalURL: sourceURL, HTTPStatus: 200, MIMEType: "text/plain",
+		RetrievedAt: time.Now().UTC(), ContentHash: source.Hash(content), RawContent: content,
+		NormalizedContent: string(content), FetcherVersion: source.FetcherVersion,
+	}}, repository: repository}
+	arguments, _ := json.Marshal(map[string]string{"url": sourceURL})
+	if _, err := handler.Execute(context.Background(), arguments); err == nil {
+		t.Fatal("source capture without trusted execution context was accepted")
+	}
+	output, err := handler.ExecuteWithContext(context.Background(), registry.InvocationContext{GoalID: "goal", TaskID: "task", ExecutionID: "execution", StepID: "step", AgentID: "agent"}, arguments)
+	if err != nil {
+		t.Fatalf("capture allowlisted test source: %v", err)
+	}
+	if repository.snapshot.ID != "persisted-source" || repository.snapshot.GoalID != "goal" || repository.snapshot.TaskID != "task" || repository.snapshot.ContentHash != source.Hash(content) {
+		t.Fatalf("persisted source context/content mismatch: %+v", repository.snapshot)
+	}
+	if len(output) == 0 {
+		t.Fatal("source capture returned empty result")
 	}
 }
 
