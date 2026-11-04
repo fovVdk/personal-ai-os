@@ -67,6 +67,7 @@ test-integration: build
 	PAIOS_TEST_DATABASE_URL='$(PAIOS_TEST_DATABASE_URL)' $(GO) test ./... -count=1; \
 	PAIOS_TEST_DATABASE_URL='$(PAIOS_TEST_DATABASE_URL)' $(GO) test -race ./... -count=1; \
 	$(GO) vet ./...; \
+	PAIOS_TEST_DATABASE_URL='$(PAIOS_TEST_DATABASE_URL)' $(GO) test -v ./tests/integration -run '^TestDurableWorkerCrashAndCheckpointRecoveryAcceptance$$' -count=1; \
 	PAIOS_TEST_DATABASE_URL='$(PAIOS_TEST_DATABASE_URL)' PAIOS_TEST_RESTART_MODE=prepare $(GO) test ./tests/integration -run '^TestPostgresPersistenceAcrossServerRestart$$' -count=1 -v; \
 	$(DOCKER_COMPOSE_TEST) restart postgres-test; \
 	$(DOCKER_COMPOSE_TEST) up -d --wait postgres-test; \

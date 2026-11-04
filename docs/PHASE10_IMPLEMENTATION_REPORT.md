@@ -84,6 +84,7 @@ Real PostgreSQL integration tests exercise:
 - migration 0008 from a new empty volume, repeat application, injected DDL rollback and clean retry;
 - PostgreSQL container restart and fresh Go Core process reading persisted Goal/Task/Execution/Evidence/Approval/Memory/Knowledge/Node/Audit/Outbox;
 - a separately prepared expired claimed run for startup recovery after database + Core restart.
+- the complete eight-step acceptance scenario in `TestDurableWorkerCrashAndCheckpointRecoveryAcceptance`: one Goal and five dependent Tasks; two independent Workers; SIGKILL the first Worker subprocess after step-1 Checkpoint; the second waits for Lease expiry, takes over with a higher fencing token, resumes from the latest Checkpoint and skips step 1; complete the dependency chain; assert Evidence/Audit/Execution and no Goal false completion; restart real Go Core while the final Task is pending, safely reject unverified Mock output, continue it with a verified test Worker, restart Core again and query final state through HTTP.
 
 `make test-integration` creates/removes only the dedicated `paios-dbtest` container and `paios-integration-test-data` volume. The primary existing Compose project and its services/data are not touched.
 
@@ -96,10 +97,15 @@ On the current macOS darwin/arm64 environment with Docker Desktop Linux/arm64, D
 - `make build`: passed.
 - `make vet`: passed.
 - `go test -race ./...`: passed.
+- `TestDurableWorkerCrashAndCheckpointRecoveryAcceptance`: passed on a fresh PostgreSQL 16/pgvector test volume (latest run 3.61 seconds). It explicitly SIGKILLs the first Worker, verifies the second claim occurs after Lease expiry and fencing increases 1→2, confirms checkpoint/step idempotency and the five-Task dependency chain, restarts Go Core with the final Task pending, checks the Mock turn fails without success Evidence, completes the same Task with a verified test Worker, then checks final state after another Core restart.
 - Isolated `make test-integration` on a fresh empty named volume: passed. This target ran all migration, database integration, full repository Go tests, race tests, vet/build, Worker Pool concurrency/fencing/checkpoint/cancellation tests, and both database/Core restart tests.
 - Migration verification began with zero recorded versions, applied all eight migrations, tested a deliberate DDL rollback/retry, and verified pgvector 0.8.7.
 - The startup-recovery fixture verified fencing increased from 5 to 6 after the expired claim was recovered and claimed by a new Worker. The unverified Mock Agent result correctly left the run/Task failed rather than claiming success. PostgreSQL then restarted and a fresh Core process successfully read persisted records.
-- The first startup-recovery assertion observed the intermediate `retry_wait` state too early; its wait condition was fixed to wait for both recovery history and a terminal Execution status before asserting. The final clean-volume run passed.
+- The first startup-recovery assertion observed the intermediate `retry_wait` state too early; its wait condition was fixed to wait for recovery history and a terminal Execution status.
+- The first full acceptance-test run itself completed the recovery scenario but failed fixture cleanup because Task dependency rows use a restrictive foreign key. Cleanup was corrected to delete only the isolated fixture's dependency edges before deleting Tasks; the next fresh-volume full run passed.
+- The Core-restart Supervisor request exposed a PostgreSQL error in `VerifiedTaskIDs`: `DISTINCT` ordered by a UUID expression while selecting its text cast. The query now orders by the selected text expression; the full fresh-volume acceptance passed afterward.
+- The Core-restart continuation request initially returned HTTP 500 because of that `VerifiedTaskIDs` query. After fixing the SQL it returned the expected conflict for unverified Mock output; the Task remained failed with no success Evidence, then a verified test Worker resumed and completed it.
+- The restart recovery fixture is Claimed-before-start, not already Running. It is requeued safely, then claimed by a new Worker; the separate SIGKILL scenario covers death after execution started and after a checkpoint.
 - `get_errors`: no workspace diagnostics at the most recent check before documentation edits.
 - Compose test profile and YAML parsing were verified in Phase 9 and the test service configuration remained parseable during Phase 10 runs.
 

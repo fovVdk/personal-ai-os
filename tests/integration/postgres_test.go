@@ -1167,6 +1167,10 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 	}
 	if len(taskIDs) > 0 {
+		if _, err := tx.Exec(ctx, "DELETE FROM task_dependencies WHERE task_id::text=ANY($1::text[]) OR depends_on_task_id::text=ANY($1::text[])", taskIDs); err != nil {
+			t.Errorf("clean integration task dependencies: %v", err)
+			return
+		}
 		if _, err := tx.Exec(ctx, "DELETE FROM execution_runs WHERE task_id::text=ANY($1::text[])", taskIDs); err != nil {
 			t.Errorf("clean integration executions: %v", err)
 			return
@@ -1413,7 +1417,7 @@ func (service *coreService) request(t *testing.T, method, path string, input any
 	}
 	responseBody := string(responseBytes)
 	if response.StatusCode != expectedStatus {
-		t.Fatalf("%s %s status=%d want=%d body=%s", method, path, response.StatusCode, expectedStatus, responseBody)
+		t.Fatalf("%s %s status=%d want=%d body=%s service_logs=%s", method, path, response.StatusCode, expectedStatus, responseBody, service.logs.String())
 	}
 	if output != nil && len(responseBody) > 0 {
 		if err := json.Unmarshal(responseBytes, output); err != nil {

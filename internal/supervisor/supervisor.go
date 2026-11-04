@@ -338,6 +338,13 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 			idempotent := hasIdempotencyGuarantee && declaration.IdempotencyGuarantee()
 			durableResult, durableRun, dispatchErr := s.executeDurably(runCtx, *selected, profile.ID, agentRequest, idempotent, idempotent)
 			if dispatchErr != nil {
+				if errors.Is(dispatchErr, ErrUnverifiedResult) {
+					updatedTask, taskErr := s.Tasks.Get(runCtx, selected.ID)
+					if taskErr == nil {
+						*selected = updatedTask
+					}
+					return TurnResult{Goal: goalItem, Plan: plan, Executions: results, Tasks: tasks, Status: string(goalItem.Status)}, ErrUnverifiedResult
+				}
 				return TurnResult{}, dispatchErr
 			}
 			updatedTask, taskErr := s.Tasks.Get(runCtx, selected.ID)

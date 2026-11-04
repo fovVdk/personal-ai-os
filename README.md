@@ -162,7 +162,7 @@ Mock 配置返回确定性结构化计划；配置真实 Provider 时 Planner �
 
 已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`、Compose/YAML 配置解析，以及 Phase 9/10 的 PostgreSQL 16/pgvector 真实迁移、集成、Worker fencing/checkpoint 和服务重启恢复验收。Phase 10 的 Mock Agent 仍输出未经独立验证的结果，因此 Worker 不会伪称真实任务已完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)、[docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)、[docs/PHASE10_IMPLEMENTATION_REPORT.md](docs/PHASE10_IMPLEMENTATION_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
 
-主要尚未实现或不完整的能力：Eino、可执行内置工具/MCP、工具审批到真实执行器的连接、持久化外部副作用前幂等 claim、后台恢复 worker、逐步 Checkpoint、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API、完整数据库集成和端到端故障恢复测试。
+主要尚未实现或不完整的能力：Eino、生产级内置工具/MCP 与审批执行器连接、真实 Agent 的独立结果验证、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API。Phase 10 的持久 Claim/Lease/fencing、Checkpoint、Step 幂等和 Worker 恢复已实现并通过真实 PostgreSQL 故障恢复验收；这不代表任意外部副作用 exactly-once。
 
 ## 依赖边界与变更原则 | Contribution boundaries
 

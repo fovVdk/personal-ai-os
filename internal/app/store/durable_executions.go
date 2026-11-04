@@ -685,7 +685,7 @@ func (s *DurableExecutionStore) Get(ctx context.Context, id string) (execution.R
 func (s *DurableExecutionStore) VerifiedTaskIDs(ctx context.Context, goalID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT e.task_id::text FROM execution_runs e JOIN tasks t ON t.id=e.task_id
 		JOIN execution_evidence evidence ON evidence.execution_run_id=e.id
-		WHERE t.goal_id=$1 AND e.status='succeeded' ORDER BY e.task_id`, goalID)
+		WHERE t.goal_id=$1 AND e.status='succeeded' ORDER BY e.task_id::text`, goalID)
 	if err != nil {
 		return nil, fmt.Errorf("list verified durable task executions: %w", err)
 	}
