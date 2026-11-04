@@ -40,6 +40,13 @@ type Config struct {
 	MaxExecutionCost float64
 	MaxExecutionTime time.Duration
 	MaxRetries       int
+	WorkerID         string
+	WorkerCount      int
+	WorkerLease      time.Duration
+	WorkerHeartbeat  time.Duration
+	WorkerPoll       time.Duration
+	WorkerRecovery   time.Duration
+	ShutdownGrace    time.Duration
 	RequestTimeout   time.Duration
 	ShutdownTimeout  time.Duration
 }
@@ -66,6 +73,13 @@ func Load() (Config, error) {
 		MaxToolCalls:     intEnv("MAX_TOOL_CALLS", 20),
 		MaxModelTokens:   intEnv("MAX_MODEL_TOKENS", 64000),
 		MaxRetries:       intEnv("MAX_RETRIES", 3),
+		WorkerID:         env("PAIOS_WORKER_ID", "paios"),
+		WorkerCount:      intEnv("PAIOS_WORKER_COUNT", 2),
+		WorkerLease:      durationEnv("PAIOS_WORKER_LEASE_SECONDS", 30),
+		WorkerHeartbeat:  durationEnv("PAIOS_WORKER_HEARTBEAT_SECONDS", 10),
+		WorkerPoll:       workerPollDuration(),
+		WorkerRecovery:   durationEnv("PAIOS_WORKER_RECOVERY_SECONDS", 5),
+		ShutdownGrace:    durationEnv("SHUTDOWN_GRACE_SECONDS", 15),
 		MaxExecutionTime: durationEnv("MAX_EXECUTION_SECONDS", 300),
 		MaxExecutionCost: floatEnv("MAX_EXECUTION_COST", 0),
 		RequestTimeout:   30 * time.Second,
@@ -108,6 +122,9 @@ func Load() (Config, error) {
 	}
 	if cfg.MaxAgentSteps < 1 || cfg.MaxModelCalls < 1 || cfg.MaxToolCalls < 1 || cfg.MaxModelTokens < 1 || cfg.MaxModelTokens > 128000 || cfg.MaxRetries < 0 || cfg.MaxExecutionTime <= 0 || cfg.MaxExecutionTime > 24*time.Hour || cfg.MaxExecutionCost < 0 || math.IsNaN(cfg.MaxExecutionCost) || math.IsInf(cfg.MaxExecutionCost, 0) {
 		return Config{}, errors.New("execution budgets must be valid; MAX_RETRIES and MAX_EXECUTION_COST may be zero")
+	}
+	if strings.TrimSpace(cfg.WorkerID) == "" || cfg.WorkerCount < 1 || cfg.WorkerCount > 128 || cfg.WorkerLease < time.Second || cfg.WorkerHeartbeat <= 0 || cfg.WorkerHeartbeat*2 >= cfg.WorkerLease || cfg.WorkerPoll <= 0 || cfg.WorkerRecovery <= 0 || cfg.ShutdownGrace <= 0 {
+		return Config{}, errors.New("worker id, concurrency, lease, heartbeat, poll, recovery, and shutdown limits must be valid")
 	}
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":
@@ -187,4 +204,9 @@ func floatEnv(key string, fallback float64) float64 {
 		return -1
 	}
 	return parsed
+}
+
+func workerPollDuration() time.Duration {
+	milliseconds := intEnv("PAIOS_WORKER_POLL_MILLISECONDS", 500)
+	return time.Duration(milliseconds) * time.Millisecond
 }

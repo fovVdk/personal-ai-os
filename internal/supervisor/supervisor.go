@@ -14,6 +14,7 @@ import (
 
 	agentregistry "personal-ai-os/internal/agent/registry"
 	agentruntime "personal-ai-os/internal/agent/runtime"
+	"personal-ai-os/internal/execution"
 	"personal-ai-os/internal/goal"
 	"personal-ai-os/internal/planner"
 	"personal-ai-os/internal/task"
@@ -43,6 +44,7 @@ type Execution struct {
 	ModelCalls   int                  `json:"model_calls"`
 	Evidence     []Evidence           `json:"evidence"`
 	CompletedAt  time.Time            `json:"completed_at"`
+	Verified     bool                 `json:"verified"`
 }
 
 type ExecutionStore interface {
@@ -80,6 +82,7 @@ type Supervisor struct {
 	Planner          planner.Generator
 	Agents           *agentregistry.Registry
 	Executions       ExecutionStore
+	Runtime          DurableRuntime
 	Usage            UsageStore
 	Recovery         StatusStore
 	Budgets          Budgets
@@ -140,11 +143,20 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		}
 	}
 	for _, execution := range savedExecutions {
-		if execution.Outcome == agentruntime.OutcomeSucceeded && len(execution.Evidence) > 0 {
+		if execution.Outcome == agentruntime.OutcomeSucceeded && execution.Verified && len(execution.Evidence) > 0 {
 			succeeded[execution.TaskID] = struct{}{}
 		}
 	}
-	if s.Recovery != nil {
+	if s.Runtime != nil {
+		verifiedTaskIDs, err := s.Runtime.VerifiedTaskIDs(runCtx, goalItem.ID)
+		if err != nil {
+			return TurnResult{}, fmt.Errorf("load verified durable execution evidence: %w", err)
+		}
+		for _, taskID := range verifiedTaskIDs {
+			succeeded[taskID] = struct{}{}
+		}
+	}
+	if s.Recovery != nil && s.Runtime == nil {
 		recoverable, err := s.Recovery.Recoverable(runCtx, 100)
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("load recoverable tasks: %w", err)
@@ -287,9 +299,11 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 				return TurnResult{}, fmt.Errorf("schedule task retry: %w", err)
 			}
 		}
-		*selected, err = s.Tasks.Transition(runCtx, selected.ID, task.Running)
-		if err != nil {
-			return TurnResult{}, fmt.Errorf("start task: %w", err)
+		if s.Runtime == nil {
+			*selected, err = s.Tasks.Transition(runCtx, selected.ID, task.Running)
+			if err != nil {
+				return TurnResult{}, fmt.Errorf("start task: %w", err)
+			}
 		}
 		agentID := "planning"
 		if strings.Contains(strings.ToLower(selected.Title), "research") || strings.Contains(strings.ToLower(selected.Title), "inventory") {
@@ -318,7 +332,32 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		if remainingCalls < 0 {
 			return TurnResult{}, errors.New("supervisor model call budget exceeded")
 		}
-		agentResult, runErr := profile.Agent.Execute(runCtx, agentruntime.Request{TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline})
+		agentRequest := agentruntime.Request{TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline}
+		if s.Runtime != nil {
+			declaration, hasIdempotencyGuarantee := profile.Agent.(agentruntime.IdempotencyDeclaration)
+			idempotent := hasIdempotencyGuarantee && declaration.IdempotencyGuarantee()
+			durableResult, durableRun, dispatchErr := s.executeDurably(runCtx, *selected, profile.ID, agentRequest, idempotent, idempotent)
+			if dispatchErr != nil {
+				return TurnResult{}, dispatchErr
+			}
+			updatedTask, taskErr := s.Tasks.Get(runCtx, selected.ID)
+			if taskErr == nil {
+				*selected = updatedTask
+			}
+			if durableRun.Status != execution.StatusSucceeded {
+				status := string(goalItem.Status)
+				if durableRun.Status == execution.StatusWaitingApproval || durableRun.Status == execution.StatusWaitingExternal || durableRun.Status == execution.StatusUnknown {
+					status = string(durableRun.Status)
+				}
+				return TurnResult{Goal: goalItem, Plan: plan, Executions: results, Tasks: tasks, Status: status}, nil
+			}
+			observedModelCalls += durableResult.ModelCalls
+			observedTokens += durableResult.TotalTokens
+			completed[selected.ID] = struct{}{}
+			results = append(results, durableResult)
+			continue
+		}
+		agentResult, runErr := profile.Agent.Execute(runCtx, agentRequest)
 		if runErr != nil {
 			failedCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			_, transitionErr := s.Tasks.Transition(failedCtx, selected.ID, task.Failed)

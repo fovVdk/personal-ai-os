@@ -132,7 +132,7 @@ Requirements: Go 1.22+（`go.mod` 语言目标为 1.22）、Docker Compose、Pos
 4. `make run` 启动 API；使用 Mock Model 不需云端凭据。
 5. 访问 `http://localhost:8080/health` 和 `http://localhost:8080/ready`。
 
-Make targets：`make build`、`make test`、`make vet`、`make fmt`、`make run`、`make migrate`、`make docker-up`、`make docker-down`。`make run` 与 `make migrate` 需要 PostgreSQL；`make docker-*` 需要 Docker，并要求先创建 `.env`。
+Make targets：`make build`、`make test`、`make vet`、`make fmt`、`make run`、`make migrate`、`make docker-up`、`make docker-down`、`make db-test-up`、`make db-test-down`、`make db-test-clean`、`make test-integration`。`make run` 与 `make migrate` 需要 PostgreSQL；`make docker-*` 需要 Docker，并要求先创建 `.env`。Phase 9 的隔离数据库验收结果见 [docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)。
 
 ## API 快速示例 | API example
 
@@ -160,7 +160,7 @@ Mock 配置返回确定性结构化计划；配置真实 Provider 时 Planner �
 
 单元测试覆盖 Goal/Task 状态转换、Evidence 门控、A0–A3 Policy、审批哈希和过期、重试/并发幂等基础能力、工具审批门、配置校验、HTTP Handler、计划 DAG、Provider/Tool-call Schema、Knowledge 分块等。PostgreSQL 集成测试存在于 `tests/integration/`，只有设置专用 `PAIOS_TEST_DATABASE_URL` 时才运行；请只使用可丢弃测试库。当前没有覆盖完整真实模型 E2E、全部领域集成和所有故障注入场景的测试套件。
 
-当前已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`，以及 Compose/YAML 配置解析。最近的工作环境中 PostgreSQL 集成测试和迁移未实际执行：`pgvector/pgvector:pg16` 镜像拉取未能完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) 获取环境相关验证及未完成清单。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
+已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`、Compose/YAML 配置解析，以及 Phase 9/10 的 PostgreSQL 16/pgvector 真实迁移、集成、Worker fencing/checkpoint 和服务重启恢复验收。Phase 10 的 Mock Agent 仍输出未经独立验证的结果，因此 Worker 不会伪称真实任务已完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)、[docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)、[docs/PHASE10_IMPLEMENTATION_REPORT.md](docs/PHASE10_IMPLEMENTATION_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
 
 主要尚未实现或不完整的能力：Eino、可执行内置工具/MCP、工具审批到真实执行器的连接、持久化外部副作用前幂等 claim、后台恢复 worker、逐步 Checkpoint、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API、完整数据库集成和端到端故障恢复测试。
 

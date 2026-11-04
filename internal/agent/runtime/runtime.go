@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -13,17 +14,21 @@ import (
 var ErrBudgetExceeded = errors.New("agent execution budget exceeded")
 
 type Request struct {
-	TaskID          string
-	GoalID          string
-	Title           string
-	Description     string
-	SuccessCriteria []string
-	MaxSteps        int
-	MaxModelCalls   int
-	MaxTokens       int
-	MaxToolCalls    int
-	MaxCost         float64
-	Deadline        time.Time
+	TaskID             string
+	GoalID             string
+	Title              string
+	Description        string
+	SuccessCriteria    []string
+	MaxSteps           int
+	MaxModelCalls      int
+	MaxTokens          int
+	MaxToolCalls       int
+	MaxCost            float64
+	Deadline           time.Time
+	ResumeCheckpoint   json.RawMessage
+	CompletedSteps     []string
+	CheckpointSequence int64
+	StateReference     string
 }
 
 type Result struct {
@@ -37,6 +42,7 @@ type Result struct {
 	OutputTokens int
 	ToolCalls    int
 	Outcome      Outcome
+	Verified     bool
 }
 
 type Outcome string
@@ -57,4 +63,27 @@ type Evidence struct {
 type Agent interface {
 	ID() string
 	Execute(context.Context, Request) (Result, error)
+}
+
+// IdempotencyDeclaration is an explicit capability; absence means external effects must not be replayed automatically.
+// 中文：IdempotencyDeclaration 显式声明可重放能力；未实现此接口表示不得自动重放外部副作用。
+type IdempotencyDeclaration interface {
+	IdempotencyGuarantee() bool
+}
+
+type Checkpoint struct {
+	StepID         string
+	Progress       json.RawMessage
+	CompletedSteps []string
+	StateReference string
+	SchemaVersion  int
+}
+
+type CheckpointWriter func(context.Context, Checkpoint) error
+type StepIdempotencyClaim func(context.Context, string, string, string) (bool, error)
+
+// ResumableAgent can restore from a checkpoint and persist progress as steps finish.
+// 中文：ResumableAgent 可从检查点恢复，并在步骤完成时持久化进度。
+type ResumableAgent interface {
+	ExecuteResumable(context.Context, Request, *Checkpoint, CheckpointWriter, StepIdempotencyClaim) (Result, error)
 }

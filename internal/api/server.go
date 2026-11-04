@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"personal-ai-os/internal/agent/registry"
 	"personal-ai-os/internal/approval"
+	"personal-ai-os/internal/execution"
 	"personal-ai-os/internal/goal"
 	"personal-ai-os/internal/knowledge"
 	"personal-ai-os/internal/memory"
@@ -36,25 +37,32 @@ import (
 const defaultOwnerID = "00000000-0000-4000-8000-000000000001"
 
 type readiness interface{ Ping(context.Context) error }
+type durableExecutionAPI interface {
+	Get(context.Context, string) (execution.Run, error)
+	RequestCancel(context.Context, string) error
+	CancelTask(context.Context, string) (bool, error)
+}
 
 // Server composes API routes from domain repositories and infrastructure checks.
 // 中文：Server 使用领域仓储和基础设施检查组装 HTTP API 路由。
 type Server struct {
-	Goals          goal.Repository
-	Tasks          task.Repository
-	Memories       memory.Repository
-	Nodes          node.Repository
-	Knowledge      knowledge.Repository
-	Planner        planner.Generator
-	Models         gateway.Gateway
-	Approvals      approval.Repository
-	Agents         *registry.Registry
-	Supervisor     *supervisor.Supervisor
-	DB             readiness
-	Logger         *slog.Logger
-	APIKey         string
-	MaxRetries     int
-	RequestTimeout time.Duration
+	Goals             goal.Repository
+	Tasks             task.Repository
+	Memories          memory.Repository
+	Nodes             node.Repository
+	Knowledge         knowledge.Repository
+	Planner           planner.Generator
+	Models            gateway.Gateway
+	Approvals         approval.Repository
+	Agents            *registry.Registry
+	Supervisor        *supervisor.Supervisor
+	WorkerStatus      func() any
+	DurableExecutions durableExecutionAPI
+	DB                readiness
+	Logger            *slog.Logger
+	APIKey            string
+	MaxRetries        int
+	RequestTimeout    time.Duration
 }
 
 func (s *Server) Handler() http.Handler {
@@ -86,6 +94,8 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/planner/generate", s.generatePlan)
 		r.Post("/supervisor/turn", s.supervisorTurn)
 		r.Get("/supervisor/status", s.supervisorStatus)
+		r.Get("/executions/{id}", s.getExecution)
+		r.Post("/executions/{id}/cancel", s.cancelExecution)
 		r.Get("/agents", s.listAgents)
 		r.Get("/agents/{id}", s.getAgent)
 		r.Post("/approvals", s.createApproval)
@@ -440,6 +450,30 @@ func (s *Server) transitionTask(next task.Status) http.HandlerFunc {
 		} else if err != nil {
 			s.internalError(w, r, "verify task goal", err)
 			return
+		}
+		if next == task.Cancelled && s.DurableExecutions != nil {
+			cancelled, err := s.DurableExecutions.CancelTask(r.Context(), current.ID)
+			if errors.Is(err, execution.ErrUncertainOutcome) {
+				writeError(w, r, http.StatusConflict, "execution_outcome_unknown", "task has an uncertain external execution outcome and requires reconciliation")
+				return
+			}
+			if err != nil {
+				s.internalError(w, r, "request execution cancellation", err)
+				return
+			}
+			if cancelled {
+				updated, err := s.Tasks.Get(r.Context(), current.ID)
+				if err != nil {
+					s.internalError(w, r, "read task cancellation state", err)
+					return
+				}
+				if updated.Status == task.Running {
+					writeJSON(w, http.StatusAccepted, map[string]any{"task": updated, "cancellation_requested": true, "outcome_may_be_uncertain": true})
+					return
+				}
+				writeJSON(w, http.StatusOK, updated)
+				return
+			}
 		}
 		updated, err := s.Tasks.Transition(r.Context(), current.ID, next)
 		if errors.Is(err, paierrors.ErrNotFound) {

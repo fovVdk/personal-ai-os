@@ -21,6 +21,7 @@ import (
 	"personal-ai-os/internal/app/config"
 	"personal-ai-os/internal/app/database"
 	"personal-ai-os/internal/app/store"
+	"personal-ai-os/internal/execution"
 	"personal-ai-os/internal/model/gateway"
 	"personal-ai-os/internal/model/provider"
 	"personal-ai-os/internal/observability"
@@ -82,6 +83,7 @@ func run() error {
 		modelProvider = provider.Mock{}
 	}
 	modelGateway := gateway.Default{Providers: []gateway.Provider{modelProvider}}
+	durableExecutions := store.NewDurableExecutionStore(pool)
 	var planGenerator planner.Generator = planner.MockGenerator{}
 	if cfg.ModelProvider != "mock" {
 		planGenerator = planner.ModelGenerator{Gateway: modelGateway, Model: cfg.ModelName, Timeout: cfg.RequestTimeout}
@@ -99,11 +101,27 @@ func run() error {
 	supervisorService := &supervisor.Supervisor{
 		Goals: repositories, Tasks: repositories.Tasks(), Planner: planGenerator, Agents: agents,
 		Executions: store.NewExecutionStore(pool), Usage: store.NewModelUsageStore(pool), Recovery: repositories,
+		Runtime: durableExecutions,
 		Budgets: supervisor.Budgets{MaxSteps: cfg.MaxAgentSteps, MaxModelCalls: cfg.MaxModelCalls, MaxToolCalls: cfg.MaxToolCalls, MaxModelTokens: cfg.MaxModelTokens, MaxCost: cfg.MaxExecutionCost, MaxRetries: cfg.MaxRetries, MaxRuntime: cfg.MaxExecutionTime},
+	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "local"
+	}
+	workerPool, err := execution.NewWorkerPool(durableExecutions, durableAgentExecutor{agents: agents}, execution.WorkerConfig{
+		WorkerID: fmt.Sprintf("%s-%s-%d", cfg.WorkerID, hostname, os.Getpid()), Concurrency: cfg.WorkerCount,
+		LeaseDuration: cfg.WorkerLease, ExecutionTimeout: cfg.MaxExecutionTime, HeartbeatInterval: cfg.WorkerHeartbeat,
+		PollInterval: cfg.WorkerPoll, RetryBaseDelay: time.Second, RecoveryInterval: cfg.WorkerRecovery,
+		RecoveryBatch: 100, ShutdownGrace: cfg.ShutdownGrace,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("configure durable execution workers: %w", err)
 	}
 	handler := (&api.Server{
 		Goals: repositories, Tasks: repositories.Tasks(), Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Nodes: repositories.Nodes(), Approvals: repositories.Approvals(), Planner: planGenerator, Models: modelGateway, Agents: agents, Supervisor: supervisorService, DB: pool,
-		Logger: logger, APIKey: cfg.APIKey, MaxRetries: cfg.MaxRetries, RequestTimeout: cfg.RequestTimeout,
+		WorkerStatus:      func() any { return workerPool.Snapshot() },
+		DurableExecutions: durableExecutions,
+		Logger:            logger, APIKey: cfg.APIKey, MaxRetries: cfg.MaxRetries, RequestTimeout: cfg.RequestTimeout,
 	}).Handler()
 	httpServer := &http.Server{
 		Addr: net.JoinHostPort(cfg.Host, cfg.Port), Handler: handler,
@@ -113,6 +131,12 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	defer workerPool.Stop()
+	go func() {
+		if err := workerPool.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.ErrorContext(ctx, "durable worker pool stopped unexpectedly", "error", err)
+		}
+	}()
 	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server starting", "address", httpServer.Addr, "environment", cfg.Environment)
@@ -138,6 +162,7 @@ func run() error {
 		}
 		return err
 	}
+	workerPool.Stop()
 	select {
 	case err := <-serverErr:
 		if err != nil {

@@ -4,13 +4,14 @@ Updated: 2026-10-31
 
 ## Current checkpoint
 
-- Documentation pass: Go source, tests, and operational templates now carry English/Chinese comments. Historical SQL migration files were intentionally left byte-for-byte unchanged because their raw-content checksums are verified on startup; their schema purposes and constraints are documented bilingually in README. README now documents current architecture, module boundaries, data flow, routes, persistence, security/configuration, verified checks, and explicitly incomplete capabilities.
-
+- Documentation pass: Go source, tests, and operational templates carry English/Chinese comments. Historical SQL migration files remain byte-for-byte unchanged because their raw-content checksums are verified on startup; schema purposes and constraints are documented in README. README documents current architecture, module boundaries, data flow, routes, persistence, security/configuration, and incomplete capabilities.
 - Phase 0 repository/environment inspection: complete.
-- Current `make build`, `make test`, `make vet`, and `go test -race ./...`: passed. Unit and handler tests cover implemented slices; database integration tests are present and skip unless a dedicated `PAIOS_TEST_DATABASE_URL` is set.
+- Phase 9 database persistence integration verification: complete. See [Database integration report](DATABASE_INTEGRATION_REPORT.md).
+- Phase 10 Durable Execution Runtime: implementation and migration 0008 are complete; the final fresh-volume `make test-integration` passed, including full Go/race/vet/build, migrations/fault injection, Worker concurrency/fencing/checkpoints/cancellation, and PostgreSQL + new Core restart recovery. Details and limits: [Phase 10 implementation report](PHASE10_IMPLEMENTATION_REPORT.md).
 - Environment: Go 1.27.3 darwin/arm64; module directive remains Go 1.22. Docker Engine 29.6.2 and Docker Compose 5.3.1 are available.
-- Note: the checkout is the GOPATH root and has no `.git` metadata. Module commands require an external temporary GOPATH to avoid Go's warning.
-- Pulling `pgvector/pgvector:pg16` exceeded three minutes and was cancelled; the image is not available locally. The attempt used isolated `/tmp/paios-postgres-test-20261031` storage, so no repository or user data was touched. Database migrations/integration checks are not yet confirmed.
+- The `pgvector/pgvector:pg16` pull succeeded on retry (arm64 digest recorded in the database report); pgvector extension 0.8.7 was verified. The dedicated test database container and named data volume were removed after the successful run. Existing Compose services were left untouched.
+- The checkout is located at the configured GOPATH root. The Makefile sets an external temporary GOPATH so Go Modules work correctly.
+- Latest checks passed: `make fmt`, `make test`, `make build`, `make vet`, full `go test ./...` and `go test -race ./...` while test PostgreSQL was available, PostgreSQL migration/integration tests, and Compose test-profile parsing.
 
 ## Completed implementation
 
@@ -23,7 +24,7 @@ Updated: 2026-10-31
 - Supervisor slice: bounded per-Goal budget for steps/model calls/tool calls/tokens/cost/runtime/retries; model-call/token usage is persisted in its own ledger across turns; deterministic task-to-agent routing; dependency-aware task execution; persistent attempt counter; recovery checks for Running/Retrying work and for evidence saved before the task status update. Mock outputs explicitly use `unverified` and cannot complete Tasks/Goals; the HTTP API surfaces this as 409 rather than claiming success.
 - Approval slice: create/list/get/approve/reject API and PostgreSQL persistence; creation and decisions write audit/outbox records. Approval execution gate verifies exact action/parameters/expiry before tool invocation.
 - Memory/Knowledge/Node slice: provenance/category/confidence validation, Memory PostgreSQL CRUD/soft deletion/full-text search, text document ingestion, rune-safe overlapping chunking, content deduplication, PostgreSQL full-text cited search, Node registration/list/detail/heartbeat repository; pgvector extension and flexible vector columns are provisioned but embeddings/vector ranking are not wired.
-- Tests: Goal and Task state transitions; policy; approval hash/expiry and API flow; retry/idempotency; tool approval gate; config safety; Goal/Task/Planner/Supervisor/Approval/Agent/Node HTTP/domain behavior; provider/Tool-call schema/value validation; Knowledge chunking.
+- Tests: Goal and Task state transitions; policy; approval hash/expiry and API flow; retry/idempotency; tool approval gate; config safety; Goal/Task/Planner/Supervisor/Approval/Agent/Node HTTP/domain behavior; provider/Tool-call schema/value validation; Knowledge chunking; PostgreSQL migrations, transaction rollback, core persistence, constraints, concurrent approvals, and restart recovery.
 - Delivery: Makefile, example environment/YAML configuration, PostgreSQL/pgvector + opt-in Ollama Compose manifest, OpenAPI, architecture/implementation docs, test report and `.gitignore` for secrets/runtime/build output.
 
 ## Not yet implemented
@@ -34,12 +35,13 @@ Updated: 2026-10-31
 - Memory embedding generation/pgvector retrieval; Knowledge APIs currently accept text only (no file/object storage ingestion).
 - Identity/RBAC/API token storage beyond the local owner and one shared API key; Node heartbeat exists at repository level but no external heartbeat route or liveness expiry worker is wired.
 - OpenTelemetry, event outbox publisher, audit query/retention policy.
-- Database integration tests run only when `PAIOS_TEST_DATABASE_URL` is set; no dedicated full approval/memory/knowledge integration or real-model E2E suite yet.
+- Manual PostgreSQL integration tests require `PAIOS_TEST_DATABASE_URL` pointing to a dedicated database whose name contains `test`. `make test-integration` owns its isolated Compose database and removes only its dedicated container and named test volume.
+- Phase 10 adds migration 0008, PostgreSQL durable enqueue/claims/leases/fencing/checkpoints/step idempotency, Worker Pool/recovery scanner, Supervisor runtime integration, and Execution status/cooperative cancellation APIs. A real PostgreSQL restart test verifies expired claimed work is re-fenced, safely re-claimed, and terminalized without treating unverified Mock output as success. Remaining limitations are listed in the implementation report.
+- No dedicated real-model E2E suite yet.
 
 ## Next actions
 
-1. Finish the isolated PostgreSQL+pgvector image pull, apply migrations and run integration tests using a dedicated disposable test database.
-2. Keep the current mock workflow honest: do not mark a real Goal done from mock prose; add an explicit verified artifact/evidence contract before changing that behavior.
-3. Implement per-step checkpoints and atomic durable idempotency claims before enabling side-effect tools.
-4. Add permission-bound built-in tools/MCP, then connect a verifier to model-produced outputs and human approvals.
-5. Add Memory vectors/Knowledge ingestion, then Node/observability and full E2E/failure-recovery coverage.
+1. Keep the current mock workflow honest: do not mark a real Goal done from mock prose; add an explicit verified artifact/evidence contract before changing that behavior.
+2. Implement per-step checkpoints and atomic durable idempotency claims before enabling side-effect tools.
+3. Add permission-bound built-in tools/MCP, then connect a verifier to model-produced outputs and human approvals.
+4. Add Memory vectors/Knowledge ingestion, then Node/observability and full E2E/failure-recovery coverage.

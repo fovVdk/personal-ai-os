@@ -240,6 +240,28 @@ paths:
       responses:
         '200':
           description: Supervisor status
+  /api/v1/executions/{id}:
+    get:
+      summary: Get durable execution status and lease metadata
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Execution status
+        '404':
+          description: Execution not found for the local owner
+  /api/v1/executions/{id}/cancel:
+    post:
+      summary: Request cooperative execution cancellation
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Queued execution cancelled
+        '202':
+          description: Running execution received a cancellation request; outcome may be uncertain
+        '409':
+          description: Execution is terminal or its outcome requires reconciliation
   /api/v1/approvals:
     post:
       summary: Request human approval for an exact tool action and parameter set

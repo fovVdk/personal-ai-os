@@ -47,6 +47,9 @@ func (s *Server) supervisorTurn(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) supervisorStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{"status": "ready", "execution_enabled": s.Supervisor != nil, "planner_enabled": s.Planner != nil, "registered_agents": 0}
+	if s.WorkerStatus != nil {
+		status["workers"] = s.WorkerStatus()
+	}
 	if s.Agents != nil {
 		status["registered_agents"] = len(s.Agents.List())
 	}

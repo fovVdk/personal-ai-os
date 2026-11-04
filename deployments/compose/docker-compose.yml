@@ -23,6 +23,31 @@ services:
         limits:
           memory: 2G
 
+  postgres-test:
+    # Disposable integration database. It is isolated by profile, project, port, user, and named test-only volume.
+    # 一次性集成测试数据库：使用独立 Profile、项目、端口、用户和专用测试卷隔离。
+    image: pgvector/pgvector:pg16
+    profiles: ["test"]
+    restart: "no"
+    environment:
+      POSTGRES_DB: paios_test
+      POSTGRES_USER: paios_test
+      POSTGRES_PASSWORD: ${PAIOS_TEST_POSTGRES_PASSWORD:-paios-test-only}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paios_test -d paios_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
   ollama:
     # Optional local model runtime; opt in with the ollama Compose profile.
     # 可选本地模型运行时；通过 ollama Compose profile 显式启用。
@@ -37,3 +62,9 @@ services:
       resources:
         limits:
           memory: 8G
+
+volumes:
+  postgres-test-data:
+    # The cleanup target removes only this explicitly named disposable test volume.
+    # 清理目标只会删除这个明确命名的一次性测试数据卷。
+    name: paios-integration-test-data

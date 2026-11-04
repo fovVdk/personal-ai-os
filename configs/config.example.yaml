@@ -37,3 +37,17 @@ execution:
   max_execution_seconds: 300
   max_execution_cost: 0
   max_retries: 3
+
+# Durable execution worker settings; runtime reads equivalent environment variables.
+# 持久化执行 Worker 配置；运行时读取对应的环境变量。
+workers:
+  id: paios
+  count: 2
+  lease_seconds: 30
+  heartbeat_seconds: 10
+  poll_milliseconds: 500
+  recovery_seconds: 5
+  shutdown_grace_seconds: 15
+  # Automatic replay of uncertain in-flight results requires an Agent-level idempotency declaration.
+  # 运行中结果不确定时，只有 Agent 级幂等声明才允许自动重放。
+  idempotency_policy: agent-declared-only
