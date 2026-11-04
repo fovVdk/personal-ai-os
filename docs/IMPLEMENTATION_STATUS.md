@@ -1,6 +1,6 @@
 # Implementation Status
 
-Updated: 2026-10-31
+Updated: 2026-11-04
 
 ## Current checkpoint
 
@@ -8,10 +8,12 @@ Updated: 2026-10-31
 - Phase 0 repository/environment inspection: complete.
 - Phase 9 database persistence integration verification: complete. See [Database integration report](DATABASE_INTEGRATION_REPORT.md).
 - Phase 10 Durable Execution Runtime and eight-step worker crash acceptance: complete. Fresh-volume PostgreSQL verification SIGKILLed a Worker after Checkpoint persistence, confirmed Lease-expiry takeover and checkpoint resume, completed a five-Task dependency chain, safely rejected unverified Mock output after Core restart, then continued with a verified test Worker. Full Go/race/vet/build and Core restart HTTP reads passed. Details/limits: [Phase 10 implementation report](PHASE10_IMPLEMENTATION_REPORT.md).
-- Environment: Go 1.27.3 darwin/arm64; module directive remains Go 1.22. Docker Engine 29.6.2 and Docker Compose 5.3.1 are available.
+- Phase 11.1–11.2 Tool Fabric and Phase 11.3 Native tools + official MCP v1.8.0 Client Adapter: implemented. Project minimum Go is 1.25.0 as directed by `agentsmcp.md`. Real SDK Client/Server Streamable HTTP, stdio subprocess crash/reconnect and a real PostgreSQL MCP→Gateway→Approval→Invocation→Audit/Outbox test pass. Added CI jobs pinning exact Go 1.25.0, checking module/toolchain match, and running tests, PostgreSQL acceptance and macOS ARM64 stdio recovery. Hosted CI result is pending its first run. MCP OAuth/credentials remain incomplete.
+- Phase 12 initial slice implemented: non-Mock Agent profiles now use a bounded resumable ModelAgent. Assistant Tool Calls use opaque aliases mapped by Go Core to exact granted Tool identities; tool results are correlated back into provider messages. Approval-waiting calls persist exact arguments/identity/Approval ID in Execution checkpoints; successful results are replayed from Gateway storage on resume rather than copied into checkpoints. Tool Call counts are persisted in migration 0010 and aggregated across Goal turns. Model-produced final prose remains unverified. Full Goal progress assessment, dynamic replanning, independent result verification, and multi-Agent delegation remain next.
+- Environment: Go 1.27.3 darwin/arm64; module minimum is Go 1.25.0. Docker Engine 29.6.2 and Docker Compose 5.3.1 are available.
 - The `pgvector/pgvector:pg16` pull succeeded on retry (arm64 digest recorded in the database report); pgvector extension 0.8.7 was verified. The dedicated test database container and named data volume were removed after the successful run. Existing Compose services were left untouched.
 - The checkout is located at the configured GOPATH root. The Makefile sets an external temporary GOPATH so Go Modules work correctly.
-- Latest checks passed: `make fmt`, `make test`, `make build`, `make vet`, full `go test ./...` and `go test -race ./...` while test PostgreSQL was available, PostgreSQL migration/integration tests, and Compose test-profile parsing.
+- Latest checks passed: Phase 12 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`, model Tool Call round-trip/approval-checkpoint resume, repeated real stdio subprocess recovery, `make build-arm64`, fresh PostgreSQL migrations 0001–0010, durable Goal Tool Call usage accounting, real MCP Gateway E2E and Phase 10 recovery acceptance. Exact Go 1.25 download remains proxy-limited locally; installed Go 1.27.3 ran local tests and CI is configured to run Go 1.25.0.
 
 ## Completed implementation
 
@@ -20,9 +22,12 @@ Updated: 2026-10-31
 - Policy primitives: A0-A3 deterministic decisions, approvals bound to exact tool/action/parameter hash and expiry, a tool execution guard that rejects side effects until approval is valid.
 - Execution slice: bounded exponential retry, legacy in-process idempotency primitive, and the Phase 10 PostgreSQL Durable Runtime with scoped request/step idempotency, multi-worker claim, lease/heartbeat/fencing, ordered Checkpoint, safe recovery, Audit/Outbox state history and background Worker Pool. Arbitrary external effects are not exactly-once; uncertain non-idempotent operations become `unknown`.
 - Planning and Agent slice: deterministic validated structured plans with DAG dependency checks; generated tasks are persisted atomically. Context-aware Model Planner strictly rejects unknown fields, extra JSON, cross-goal output, invalid DAGs and inconsistent estimates. General, Research, and Planning Mock Agents are registered and listed through API.
-- Model slice: provider-neutral Gateway, deterministic Mock, OpenAI-compatible Chat Completions and Ollama `/api/chat` providers, token usage, bounded timeouts/response sizes, provider fallback, and strict Tool-call allowlist/JSON schema/required-field/value validation. Runtime config selects Mock/OpenAI-compatible/Ollama; real model keys stay in environment. Tool-call results remain proposals only; no model output automatically executes tools. JSON tool schemas are intentionally restricted to the implemented subset and unsupported schema keywords fail closed.
+- Model slice: provider-neutral Gateway, deterministic Mock, OpenAI-compatible Chat Completions and Ollama `/api/chat` providers, token usage, bounded timeouts/response sizes, provider fallback, strict Tool-call schema validation and provider-neutral assistant-call/tool-result message roundtrip. Non-Mock Agents use the resumable ModelAgent; all actual calls still pass through the Core Tool Gateway.
 - Supervisor slice: bounded per-Goal budget for steps/model calls/tool calls/tokens/cost/runtime/retries; model-call/token usage is persisted in its own ledger across turns; deterministic task-to-agent routing; dependency-aware durable task execution and evidence reconciliation. Mock outputs explicitly use `unverified` and cannot complete Tasks/Goals; the Durable Worker and HTTP API do not claim simulated work succeeded.
 - Approval slice: create/list/get/approve/reject API and PostgreSQL persistence; creation and decisions write audit/outbox records. Approval execution gate verifies exact action/parameters/expiry before tool invocation.
+- Tool Fabric: immutable provider-qualified Tool ID/version Registry with schemas, source/type/risk/idempotency/timeout/environment/health/enabled metadata; registration does not grant permission. The Core Gateway validates canonical version-bound arguments, trusted grants/Policy, live Worker Lease/Fencing, one-time exact-context approvals, durable Invocation idempotency, output schema, timeout and unknown outcomes. Durable Agent Runtime receives only a structured Gateway-backed Tool Caller with a Core-observed budget. PostgreSQL migration 0009 stores invocation state and context-bound approval fields; approval can requeue the same Execution, and Lease recovery marks active Tool calls unknown/revokes pending approvals.
+- Model Tool orchestration: model tool names are opaque aliases bound by Core to exact Registry identities. ModelAgent persists pending structured calls and Approval ID in a bounded checkpoint, resumes the same parameters/idempotency key after approval/restart, reloads completed tool results through idempotent Gateway replay, and never persists tool result content in its checkpoint. Final model-generated completion claims remain unverified. Migration 0010 persists Core-observed Tool Call usage for Goal-level budgets.
+- Native read-only tools: `time.now`, authorized-root `filesystem.read/list`, Memory/Knowledge keyword search, and optional `http.fetch`. HTTP fetch needs an exact allowlist, blocks private/non-public resolutions, forbids redirects and caps response size. Filesystem root must be trusted and not concurrently modified by an untrusted local process. No shell, file write/delete, payment, device or robot tool is registered.
 - Memory/Knowledge/Node slice: provenance/category/confidence validation, Memory PostgreSQL CRUD/soft deletion/full-text search, text document ingestion, rune-safe overlapping chunking, content deduplication, PostgreSQL full-text cited search, Node registration/list/detail/heartbeat repository; pgvector extension and flexible vector columns are provisioned but embeddings/vector ranking are not wired.
 - Tests: Goal and Task state transitions; policy; approval hash/expiry and API flow; retry/idempotency; tool approval gate; config safety; Goal/Task/Planner/Supervisor/Approval/Agent/Node HTTP/domain behavior; provider/Tool-call schema/value validation; Knowledge chunking; PostgreSQL migrations, transaction rollback, core persistence, constraints, concurrent approvals, restart recovery, and the full Worker crash/Checkpoint/five-dependent-Task acceptance scenario.
 - Delivery: Makefile, example environment/YAML configuration, PostgreSQL/pgvector + opt-in Ollama Compose manifest, OpenAPI, architecture/implementation docs, test report and `.gitignore` for secrets/runtime/build output.
@@ -30,7 +35,11 @@ Updated: 2026-10-31
 ## Not yet implemented
 
 - Eino adapter; Model fallback is interface-level and does not yet include retry/circuit-breaker/health policy.
-- Safe built-in tool registry (time/query/note/allowlisted-file), user-facing tool approval association, and MCP integration. Tool authorization primitives are tested but there are no production side-effect tools.
+- MCP official Client supports Streamable HTTP and explicitly configured stdio commands; real SDK Servers are tested over both transports, including stdio process crash/restart. OAuth/remote credentials are not implemented. Remote adapter is not implemented.
+- ModelAgent can execute structured provider `ToolCall` proposals only through the injected Gateway caller. Generic orchestration for arbitrary Agents is not provided. Approval continuation relies on a resumable Agent restoring and replaying the same Step/idempotency request.
+- Supervisor evidence-based progress assessment and dynamic plan revalidation/replanning are not yet implemented; it still plans only when a Goal has no persisted Tasks.
+- ModelAgent final output is deliberately unverified; no independent artifact verifier exists. Model-call/token usage from unsuccessful runs is not fully included in cross-turn budget aggregation yet, though Tool Invocation counts are persisted.
+- No production side-effect tools are registered. All built-ins are read-only; the generic Gateway supports context-bound approval but external side-effect adapters still need exact idempotency/verifier policies.
 - No production side-effect Tool runner or independently verified real Agent is enabled. The worker runtime and Step idempotency contracts are implemented, but future tools must provide their own external idempotency guarantee and verifier before automatic replay is safe.
 - Memory embedding generation/pgvector retrieval; Knowledge APIs currently accept text only (no file/object storage ingestion).
 - Identity/RBAC/API token storage beyond the local owner and one shared API key; Node heartbeat exists at repository level but no external heartbeat route or liveness expiry worker is wired.
@@ -40,7 +49,8 @@ Updated: 2026-10-31
 
 ## Next actions
 
-1. Keep the current mock workflow honest: do not mark a real Goal done from mock prose; add an explicit verified artifact/evidence contract before changing that behavior.
-2. Connect independently verified artifacts/results to the Worker success gate before reporting real-world completion.
-3. Add permission-bound built-in tools/MCP with explicit external idempotency and Approval linkage before enabling side effects.
-4. Add Memory vectors/Knowledge ingestion, then Node/observability and full E2E/failure-recovery coverage.
+1. Implement Supervisor evidence/progress assessment and persist a bounded decision record for continue, stop, wait-approval, or replan.
+2. Add transactional versioned plan replacement/reconciliation for changed Goal constraints and failed/blocked Task evidence.
+3. Add an independent artifact verifier before any ModelAgent result can complete a Task or Goal.
+4. Persist model-call/token usage for unsuccessful/approval-waiting runs; Tool Calls are already counted from durable Invocation records.
+5. Before enabling side-effect tools or authenticated MCP servers, add durable grants, external idempotency/verifier contracts, sandboxing and secret-provider/OAuth integration.

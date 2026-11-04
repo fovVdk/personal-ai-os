@@ -17,19 +17,21 @@ func NewModelUsageStore(pool *pgxpool.Pool) *ModelUsageStore { return &ModelUsag
 
 func (s *ModelUsageStore) ModelUsage(ctx context.Context, goalID string) (supervisor.UsageTotals, error) {
 	var usage supervisor.UsageTotals
-	err := s.pool.QueryRow(ctx, `SELECT COALESCE(sum(model_calls),0),COALESCE(sum(total_tokens),0) FROM model_usage WHERE goal_id=$1`, goalID).Scan(&usage.ModelCalls, &usage.ModelTokens)
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(sum(model_calls),0),COALESCE(sum(total_tokens),0),
+		GREATEST(COALESCE(sum(tool_calls),0),(SELECT count(*) FROM tool_invocations WHERE goal_id=$1))
+		FROM model_usage WHERE goal_id=$1`, goalID).Scan(&usage.ModelCalls, &usage.ModelTokens, &usage.ToolCalls)
 	if err != nil {
 		return supervisor.UsageTotals{}, fmt.Errorf("query model usage: %w", err)
 	}
 	return usage, nil
 }
 
-func (s *ModelUsageStore) RecordModelUsage(ctx context.Context, goalID string, calls, inputTokens, outputTokens int) error {
-	if calls < 0 || inputTokens < 0 || outputTokens < 0 {
+func (s *ModelUsageStore) RecordModelUsage(ctx context.Context, goalID string, calls, toolCalls, inputTokens, outputTokens int) error {
+	if calls < 0 || toolCalls < 0 || inputTokens < 0 || outputTokens < 0 {
 		return fmt.Errorf("model usage counters cannot be negative")
 	}
 	totalTokens := inputTokens + outputTokens
-	if calls == 0 && totalTokens == 0 {
+	if calls == 0 && toolCalls == 0 && totalTokens == 0 {
 		return nil
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -37,11 +39,11 @@ func (s *ModelUsageStore) RecordModelUsage(ctx context.Context, goalID string, c
 		return fmt.Errorf("begin model usage transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, `INSERT INTO model_usage(goal_id,provider,model,operation,model_calls,input_tokens,output_tokens,total_tokens)
-		VALUES($1,'planner','configured-model','plan-generation',$2,$3,$4,$5)`, goalID, calls, inputTokens, outputTokens, totalTokens); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO model_usage(goal_id,provider,model,operation,model_calls,tool_calls,input_tokens,output_tokens,total_tokens)
+		VALUES($1,'planner','configured-model','plan-generation',$2,$3,$4,$5,$6)`, goalID, calls, toolCalls, inputTokens, outputTokens, totalTokens); err != nil {
 		return fmt.Errorf("record model usage: %w", err)
 	}
-	if err := recordMutation(ctx, tx, LocalOwnerID, "model.usage_recorded", "goals", goalID, map[string]int{"model_calls": calls, "input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": totalTokens}); err != nil {
+	if err := recordMutation(ctx, tx, LocalOwnerID, "model.usage_recorded", "goals", goalID, map[string]int{"model_calls": calls, "tool_calls": toolCalls, "input_tokens": inputTokens, "output_tokens": outputTokens, "total_tokens": totalTokens}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

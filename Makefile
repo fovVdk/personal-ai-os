@@ -8,13 +8,17 @@ export GO111MODULE := on
 DOCKER_COMPOSE_TEST := docker compose -p paios-dbtest --env-file .env.example --profile test -f deployments/compose/docker-compose.yml
 PAIOS_TEST_DATABASE_URL ?= postgres://paios_test:paios-test-only@127.0.0.1:55432/paios_test?sslmode=disable
 
-.PHONY: build test vet run migrate docker-up docker-down db-test-up db-test-down db-test-clean test-integration fmt
+.PHONY: build build-arm64 test vet run migrate docker-up docker-down db-test-up db-test-down db-test-clean test-integration fmt
 
 build:
 	# Build the HTTP service binary.
 	# 编译 HTTP 服务二进制文件。
 	mkdir -p bin
 	$(GO) build -o bin/paios ./cmd/paios
+
+build-arm64:
+	mkdir -p bin
+	GOOS=darwin GOARCH=arm64 $(GO) build -o bin/paios-darwin-arm64 ./cmd/paios
 
 test:
 	# Run all package unit and handler tests; opt-in DB integration tests need their own URL.

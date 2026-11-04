@@ -1,3 +1,3 @@
-// Package mcp adapts MCP protocol clients and servers to local tool interfaces.
-// 中文：本包预留 MCP 协议适配边界；当前尚未实现 MCP 客户端或服务端。
+// Package mcp adapts the official MCP Go SDK v1.8.0 (Go 1.25+) into the Go Core Tool Registry.
+// 中文：mcp 包将官方 MCP Go SDK v1.8.0（要求 Go 1.25+）适配到 Go Core Tool Registry。
 package mcp

@@ -1,0 +1,60 @@
+name: Go CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go-1-25-acceptance:
+    name: Go 1.25.0 tests and PostgreSQL acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up exact Go 1.25.0
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.0
+          cache: true
+      - name: Assert Go toolchain
+        run: |
+          test "$(go env GOVERSION)" = "go1.25.0"
+          go version
+      - name: Format check
+        run: test -z "$(gofmt -l $(find cmd internal migrations pkg -name '*.go' -type f))"
+      - name: Unit tests
+        run: make test
+      - name: Build and vet
+        run: make build && make vet
+      - name: Race tests
+        run: GOPATH=/tmp/paios-gopath GO111MODULE=on go test -race ./...
+      - name: PostgreSQL and MCP integration acceptance
+        run: make test-integration
+      - name: Compose configuration
+        run: docker compose --env-file .env.example -f deployments/compose/docker-compose.yml config -q
+
+  darwin-arm64:
+    name: Go 1.25.0 macOS ARM64 build and stdio tests
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up exact Go 1.25.0
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.0
+          cache: true
+      - name: Assert Go toolchain
+        run: |
+          test "$(go env GOVERSION)" = "go1.25.0"
+          go version
+          uname -m
+      - name: Native MCP stdio process lifecycle and recovery tests
+        run: GOPATH=/tmp/paios-gopath GO111MODULE=on go test -race -count=5 ./internal/tool/mcp -run 'TestMCPStdioServerProcess|TestRealStdioSubprocessLifecycleCrashAndRecovery'
+      - name: Build darwin ARM64 binary
+        run: make build-arm64

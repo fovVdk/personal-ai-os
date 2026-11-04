@@ -31,6 +31,8 @@ import (
 	"personal-ai-os/internal/planner"
 	"personal-ai-os/internal/supervisor"
 	"personal-ai-os/internal/task"
+	toolmcp "personal-ai-os/internal/tool/mcp"
+	toolregistry "personal-ai-os/internal/tool/registry"
 	paierrors "personal-ai-os/pkg/errors"
 )
 
@@ -41,20 +43,25 @@ type durableExecutionAPI interface {
 	Get(context.Context, string) (execution.Run, error)
 	RequestCancel(context.Context, string) error
 	CancelTask(context.Context, string) (bool, error)
+	ResumeApproval(context.Context, string, string) error
 }
 
 // Server composes API routes from domain repositories and infrastructure checks.
 // 中文：Server 使用领域仓储和基础设施检查组装 HTTP API 路由。
 type Server struct {
-	Goals             goal.Repository
-	Tasks             task.Repository
-	Memories          memory.Repository
-	Nodes             node.Repository
-	Knowledge         knowledge.Repository
-	Planner           planner.Generator
-	Models            gateway.Gateway
-	Approvals         approval.Repository
-	Agents            *registry.Registry
+	Goals     goal.Repository
+	Tasks     task.Repository
+	Memories  memory.Repository
+	Nodes     node.Repository
+	Knowledge knowledge.Repository
+	Planner   planner.Generator
+	Models    gateway.Gateway
+	Approvals approval.Repository
+	Agents    *registry.Registry
+	Tools     *toolregistry.Registry
+	// MCPServers exposes only local Server status/lifecycle, never SDK sessions or credentials.
+	// 中文：MCPServers 仅提供本地 Server 状态/生命周期，不暴露 SDK Session 或凭据。
+	MCPServers        *toolmcp.Manager
 	Supervisor        *supervisor.Supervisor
 	WorkerStatus      func() any
 	DurableExecutions durableExecutionAPI
@@ -98,6 +105,13 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/executions/{id}/cancel", s.cancelExecution)
 		r.Get("/agents", s.listAgents)
 		r.Get("/agents/{id}", s.getAgent)
+		r.Get("/tools", s.listTools)
+		r.Get("/tools/{provider}/{tool}/{version}", s.getTool)
+		r.Get("/mcp/servers", s.listMCPServers)
+		r.Post("/mcp/servers/{id}/enable", s.setMCPServerEnabled(true))
+		r.Post("/mcp/servers/{id}/disable", s.setMCPServerEnabled(false))
+		r.Post("/mcp/servers/{id}/reconnect", s.reconnectMCPServer)
+		r.Delete("/mcp/servers/{id}", s.removeMCPServer)
 		r.Post("/approvals", s.createApproval)
 		r.Get("/approvals", s.listApprovals)
 		r.Get("/approvals/{id}", s.getApproval)

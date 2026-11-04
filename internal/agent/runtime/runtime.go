@@ -29,6 +29,31 @@ type Request struct {
 	CompletedSteps     []string
 	CheckpointSequence int64
 	StateReference     string
+	Tools              ToolCaller `json:"-"`
+}
+
+type ToolCallRequest struct {
+	ProviderID     string
+	ToolID         string
+	Version        string
+	StepID         string
+	IdempotencyKey string
+	ApprovalID     string
+	Arguments      json.RawMessage
+}
+
+type ToolCallResult struct {
+	InvocationID string
+	Status       string
+	ApprovalID   string
+	Result       json.RawMessage
+	Replayed     bool
+}
+
+// ToolCaller exposes only the Go Core Gateway contract; Agent code never receives native Tool handlers.
+// 中文：ToolCaller 只暴露 Go Core Gateway 契约；Agent 代码不会收到 Native Tool Handler。
+type ToolCaller interface {
+	ExecuteTool(context.Context, ToolCallRequest) (ToolCallResult, error)
 }
 
 type Result struct {

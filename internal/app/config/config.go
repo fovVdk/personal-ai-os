@@ -5,8 +5,10 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -15,24 +17,30 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"personal-ai-os/internal/tool/mcp"
 )
 
 // Config contains runtime settings. Secrets are intentionally never included in String output.
 // 中文：Config 保存运行时设置；Secret 不得通过其字符串形式暴露。
 type Config struct {
-	Environment      string
-	Host             string
-	Port             string
-	DatabaseURL      string
-	LogLevel         string
-	APIKey           string
-	ModelProvider    string
-	ModelBaseURL     string
-	ModelAPIKey      string
-	ModelName        string
-	OllamaBaseURL    string
-	DataDir          string
-	FileStorageDir   string
+	Environment           string
+	Host                  string
+	Port                  string
+	DatabaseURL           string
+	LogLevel              string
+	APIKey                string
+	ModelProvider         string
+	ModelBaseURL          string
+	ModelAPIKey           string
+	ModelName             string
+	OllamaBaseURL         string
+	DataDir               string
+	FileStorageDir        string
+	HTTPFetchAllowedHosts []string
+	// MCPServers are operator-provided definitions; empty disables MCP connections.
+	// 中文：MCPServers 由运维配置；为空时不连接 MCP Server。
+	MCPServers       []mcp.ServerConfig
 	MaxAgentSteps    int
 	MaxModelCalls    int
 	MaxToolCalls     int
@@ -54,36 +62,42 @@ type Config struct {
 // Load reads environment variables and applies safe local-development defaults.
 // 中文：Load 从环境变量读取配置，并应用适用于本地开发的安全默认值。
 func Load() (Config, error) {
+	mcpServers, err := mcpServersEnv()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
-		Environment:      env("APP_ENV", "development"),
-		Host:             env("APP_HOST", "127.0.0.1"),
-		Port:             env("APP_PORT", "8080"),
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		LogLevel:         strings.ToLower(env("LOG_LEVEL", "info")),
-		APIKey:           os.Getenv("PAIOS_API_KEY"),
-		ModelProvider:    env("MODEL_PROVIDER", "mock"),
-		ModelBaseURL:     os.Getenv("MODEL_BASE_URL"),
-		ModelAPIKey:      os.Getenv("MODEL_API_KEY"),
-		ModelName:        env("MODEL_NAME", "mock"),
-		OllamaBaseURL:    env("OLLAMA_BASE_URL", "http://localhost:11434"),
-		DataDir:          env("DATA_DIR", "./data"),
-		FileStorageDir:   env("FILE_STORAGE_DIR", "./data/files"),
-		MaxAgentSteps:    intEnv("MAX_AGENT_STEPS", 12),
-		MaxModelCalls:    intEnv("MAX_MODEL_CALLS", 8),
-		MaxToolCalls:     intEnv("MAX_TOOL_CALLS", 20),
-		MaxModelTokens:   intEnv("MAX_MODEL_TOKENS", 64000),
-		MaxRetries:       intEnv("MAX_RETRIES", 3),
-		WorkerID:         env("PAIOS_WORKER_ID", "paios"),
-		WorkerCount:      intEnv("PAIOS_WORKER_COUNT", 2),
-		WorkerLease:      durationEnv("PAIOS_WORKER_LEASE_SECONDS", 30),
-		WorkerHeartbeat:  durationEnv("PAIOS_WORKER_HEARTBEAT_SECONDS", 10),
-		WorkerPoll:       workerPollDuration(),
-		WorkerRecovery:   durationEnv("PAIOS_WORKER_RECOVERY_SECONDS", 5),
-		ShutdownGrace:    durationEnv("SHUTDOWN_GRACE_SECONDS", 15),
-		MaxExecutionTime: durationEnv("MAX_EXECUTION_SECONDS", 300),
-		MaxExecutionCost: floatEnv("MAX_EXECUTION_COST", 0),
-		RequestTimeout:   30 * time.Second,
-		ShutdownTimeout:  15 * time.Second,
+		Environment:           env("APP_ENV", "development"),
+		Host:                  env("APP_HOST", "127.0.0.1"),
+		Port:                  env("APP_PORT", "8080"),
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		LogLevel:              strings.ToLower(env("LOG_LEVEL", "info")),
+		APIKey:                os.Getenv("PAIOS_API_KEY"),
+		ModelProvider:         env("MODEL_PROVIDER", "mock"),
+		ModelBaseURL:          os.Getenv("MODEL_BASE_URL"),
+		ModelAPIKey:           os.Getenv("MODEL_API_KEY"),
+		ModelName:             env("MODEL_NAME", "mock"),
+		OllamaBaseURL:         env("OLLAMA_BASE_URL", "http://localhost:11434"),
+		DataDir:               env("DATA_DIR", "./data"),
+		FileStorageDir:        env("FILE_STORAGE_DIR", "./data/files"),
+		HTTPFetchAllowedHosts: csvEnv("HTTP_FETCH_ALLOWED_HOSTS"),
+		MCPServers:            mcpServers,
+		MaxAgentSteps:         intEnv("MAX_AGENT_STEPS", 12),
+		MaxModelCalls:         intEnv("MAX_MODEL_CALLS", 8),
+		MaxToolCalls:          intEnv("MAX_TOOL_CALLS", 20),
+		MaxModelTokens:        intEnv("MAX_MODEL_TOKENS", 64000),
+		MaxRetries:            intEnv("MAX_RETRIES", 3),
+		WorkerID:              env("PAIOS_WORKER_ID", "paios"),
+		WorkerCount:           intEnv("PAIOS_WORKER_COUNT", 2),
+		WorkerLease:           durationEnv("PAIOS_WORKER_LEASE_SECONDS", 30),
+		WorkerHeartbeat:       durationEnv("PAIOS_WORKER_HEARTBEAT_SECONDS", 10),
+		WorkerPoll:            workerPollDuration(),
+		WorkerRecovery:        durationEnv("PAIOS_WORKER_RECOVERY_SECONDS", 5),
+		ShutdownGrace:         durationEnv("SHUTDOWN_GRACE_SECONDS", 15),
+		MaxExecutionTime:      durationEnv("MAX_EXECUTION_SECONDS", 300),
+		MaxExecutionCost:      floatEnv("MAX_EXECUTION_COST", 0),
+		RequestTimeout:        30 * time.Second,
+		ShutdownTimeout:       15 * time.Second,
 	}
 	cfg.RequestTimeout = cfg.MaxExecutionTime + 5*time.Second
 	if cfg.Port == "" {
@@ -167,6 +181,26 @@ func Load() (Config, error) {
 	if cfg.ModelProvider != "mock" && os.Getenv("MODEL_NAME") == "" {
 		return Config{}, errors.New("MODEL_NAME must be set explicitly for ollama/openai-compatible provider")
 	}
+	seenFetchHosts := map[string]bool{}
+	for _, host := range cfg.HTTPFetchAllowedHosts {
+		if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "/:@*\\\r\n\x00") || strings.HasSuffix(host, ".") {
+			return Config{}, fmt.Errorf("invalid HTTP_FETCH_ALLOWED_HOSTS entry %q", host)
+		}
+		if seenFetchHosts[strings.ToLower(host)] {
+			return Config{}, fmt.Errorf("duplicate HTTP_FETCH_ALLOWED_HOSTS entry %q", host)
+		}
+		seenFetchHosts[strings.ToLower(host)] = true
+	}
+	seenMCPIDs := map[string]bool{}
+	for _, server := range cfg.MCPServers {
+		if err := mcp.ValidateServerConfig(server); err != nil {
+			return Config{}, fmt.Errorf("invalid MCP_SERVERS_JSON configuration: %w", err)
+		}
+		if seenMCPIDs[server.ID] {
+			return Config{}, fmt.Errorf("duplicate MCP server id %q", server.ID)
+		}
+		seenMCPIDs[server.ID] = true
+	}
 	return cfg, nil
 }
 
@@ -175,6 +209,43 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func csvEnv(key string) []string {
+	value := os.Getenv(key)
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		items = append(items, strings.TrimSpace(part))
+	}
+	return items
+}
+
+func mcpServersEnv() ([]mcp.ServerConfig, error) {
+	value := os.Getenv("MCP_SERVERS_JSON")
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	if len(value) > 64<<10 {
+		return nil, errors.New("MCP_SERVERS_JSON exceeds 64 KiB")
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var servers []mcp.ServerConfig
+	if err := decoder.Decode(&servers); err != nil {
+		return nil, errors.New("MCP_SERVERS_JSON must be a valid server array")
+	}
+	if len(servers) > 32 {
+		return nil, errors.New("MCP_SERVERS_JSON may configure at most 32 servers")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("MCP_SERVERS_JSON contains trailing data")
+	}
+	return servers, nil
 }
 
 func intEnv(key string, fallback int) int {

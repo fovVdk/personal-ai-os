@@ -12,6 +12,9 @@ build/
 *.out
 coverage/
 
+# Accidental in-checkout GOPATH module cache (repository builds use /tmp/paios-gopath)
+pkg/mod/
+
 # macOS/editor metadata
 .DS_Store
 .vscode/

@@ -14,16 +14,17 @@ import (
 )
 
 func (p *Postgres) CreateApproval(ctx context.Context, item approval.Request) (approval.Request, error) {
-	if item.Status == "" {
-		item.Status = approval.Pending
+	if item.Status != "" && item.Status != approval.Pending {
+		return approval.Request{}, errors.New("new approval requests must be pending")
 	}
+	item.Status = approval.Pending
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return approval.Request{}, fmt.Errorf("begin approval creation: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	err = tx.QueryRow(ctx, `INSERT INTO approvals(user_id,task_id,tool_id,action,parameters_hash,risk_level,status,expires_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id::text,created_at`, item.UserID, item.TaskID, item.ToolID, item.Action, item.ParametersHash, item.RiskLevel, item.Status, item.ExpiresAt).Scan(&item.ID, &item.CreatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO approvals(user_id,task_id,tool_id,action,parameters_hash,risk_level,status,expires_at,tool_version,execution_id,step_id,agent_id,invocation_context_hash)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')::uuid,$11,$12,$13) RETURNING id::text,created_at`, item.UserID, item.TaskID, item.ToolID, item.Action, item.ParametersHash, item.RiskLevel, item.Status, item.ExpiresAt, item.ToolVersion, item.ExecutionID, item.StepID, item.AgentID, item.InvocationContextHash).Scan(&item.ID, &item.CreatedAt)
 	if err != nil {
 		return approval.Request{}, fmt.Errorf("create approval: %w", err)
 	}
@@ -40,7 +41,8 @@ func (p *Postgres) ListPending(ctx context.Context, userID string, limit int) ([
 	if limit < 1 || limit > 200 {
 		limit = 100
 	}
-	rows, err := p.pool.Query(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at
+	rows, err := p.pool.Query(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at,
+		tool_version,COALESCE(execution_id::text,''),step_id,agent_id,invocation_context_hash,consumed_at
 		FROM approvals WHERE user_id=$1 AND status='pending' AND expires_at>now() ORDER BY created_at LIMIT $2`, userID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list pending approvals: %w", err)
@@ -61,7 +63,8 @@ func (p *Postgres) ListPending(ctx context.Context, userID string, limit int) ([
 }
 
 func (p *Postgres) GetApproval(ctx context.Context, userID, id string) (approval.Request, error) {
-	item, err := scanApproval(p.pool.QueryRow(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at
+	item, err := scanApproval(p.pool.QueryRow(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at,
+		tool_version,COALESCE(execution_id::text,''),step_id,agent_id,invocation_context_hash,consumed_at
 		FROM approvals WHERE user_id=$1 AND id=$2`, userID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return approval.Request{}, paierrors.ErrNotFound
@@ -78,7 +81,8 @@ func (p *Postgres) DecideApproval(ctx context.Context, userID, id string, status
 		return approval.Request{}, fmt.Errorf("begin approval decision: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	item, err := scanApproval(tx.QueryRow(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at
+	item, err := scanApproval(tx.QueryRow(ctx, `SELECT id::text,user_id::text,task_id::text,tool_id,action,parameters_hash,risk_level,status,expires_at,approved_at,created_at,
+		tool_version,COALESCE(execution_id::text,''),step_id,agent_id,invocation_context_hash,consumed_at
 		FROM approvals WHERE user_id=$1 AND id=$2 FOR UPDATE`, userID, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return approval.Request{}, paierrors.ErrNotFound
@@ -119,7 +123,8 @@ type approvalScanner interface{ Scan(...any) error }
 
 func scanApproval(row approvalScanner) (approval.Request, error) {
 	var item approval.Request
-	err := row.Scan(&item.ID, &item.UserID, &item.TaskID, &item.ToolID, &item.Action, &item.ParametersHash, &item.RiskLevel, &item.Status, &item.ExpiresAt, &item.ApprovedAt, &item.CreatedAt)
+	err := row.Scan(&item.ID, &item.UserID, &item.TaskID, &item.ToolID, &item.Action, &item.ParametersHash, &item.RiskLevel, &item.Status, &item.ExpiresAt, &item.ApprovedAt, &item.CreatedAt,
+		&item.ToolVersion, &item.ExecutionID, &item.StepID, &item.AgentID, &item.InvocationContextHash, &item.ConsumedAt)
 	return item, err
 }
 

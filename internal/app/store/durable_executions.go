@@ -360,6 +360,7 @@ func (s *DurableExecutionStore) Complete(ctx context.Context, lease execution.Le
 	}
 	var modelUsage struct {
 		ModelCalls   int  `json:"model_calls"`
+		ToolCalls    int  `json:"tool_calls"`
 		InputTokens  int  `json:"input_tokens"`
 		OutputTokens int  `json:"output_tokens"`
 		TotalTokens  int  `json:"total_tokens"`
@@ -368,12 +369,12 @@ func (s *DurableExecutionStore) Complete(ctx context.Context, lease execution.Le
 	if err := json.Unmarshal(result, &modelUsage); err != nil {
 		return fmt.Errorf("decode execution model usage: %w", err)
 	}
-	if !modelUsage.Verified || modelUsage.ModelCalls < 0 || modelUsage.InputTokens < 0 || modelUsage.OutputTokens < 0 || modelUsage.TotalTokens < modelUsage.InputTokens+modelUsage.OutputTokens {
+	if !modelUsage.Verified || modelUsage.ModelCalls < 0 || modelUsage.ToolCalls < 0 || modelUsage.InputTokens < 0 || modelUsage.OutputTokens < 0 || modelUsage.TotalTokens < modelUsage.InputTokens+modelUsage.OutputTokens {
 		return errors.New("execution result contains invalid model usage")
 	}
-	if modelUsage.ModelCalls > 0 || modelUsage.TotalTokens > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO model_usage(goal_id,provider,model,operation,model_calls,input_tokens,output_tokens,total_tokens)
-			SELECT goal_id,'agent',$2,'agent-execution',$3,$4,$5,$6 FROM tasks WHERE id=$1`, taskID, agentID, modelUsage.ModelCalls, modelUsage.InputTokens, modelUsage.OutputTokens, modelUsage.TotalTokens); err != nil {
+	if modelUsage.ModelCalls > 0 || modelUsage.ToolCalls > 0 || modelUsage.TotalTokens > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO model_usage(goal_id,provider,model,operation,model_calls,tool_calls,input_tokens,output_tokens,total_tokens)
+			SELECT goal_id,'agent',$2,'agent-execution',$3,$4,$5,$6,$7 FROM tasks WHERE id=$1`, taskID, agentID, modelUsage.ModelCalls, modelUsage.ToolCalls, modelUsage.InputTokens, modelUsage.OutputTokens, modelUsage.TotalTokens); err != nil {
 			return fmt.Errorf("persist durable execution model usage: %w", err)
 		}
 	}
@@ -439,6 +440,17 @@ func (s *DurableExecutionStore) Fail(ctx context.Context, lease execution.Lease,
 			next, taskStatus, class = execution.StatusRetryWait, "retrying", execution.FailureSafeResume
 		} else {
 			next, taskStatus = execution.StatusUnknown, "waiting_external"
+		}
+	}
+	if !cancellationRequested && class == execution.FailureApprovalNeeded {
+		var alreadyApproved bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM tool_invocations i JOIN approvals a ON a.id=i.approval_id
+			WHERE i.execution_id=$1 AND i.status='waiting_approval' AND a.status='approved' AND a.consumed_at IS NULL AND a.expires_at>now())`, lease.ExecutionID).Scan(&alreadyApproved); err != nil {
+			return fmt.Errorf("check approval before waiting transition: %w", err)
+		}
+		if alreadyApproved {
+			next, taskStatus, class = execution.StatusQueued, "retrying", execution.FailureRecovered
+			reason = "Tool approval was granted while the Worker was unwinding; execution queued for continuation"
 		}
 	}
 	if delay < 0 {
@@ -599,9 +611,10 @@ func (s *DurableExecutionStore) RecoverExpired(ctx context.Context, limit int, r
 		return 0, fmt.Errorf("begin expired execution recovery: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	rows, err := tx.Query(ctx, `SELECT id::text,task_id::text,status,worker_id,fencing_token,attempt,max_attempts,retry_safe,idempotent,cancellation_requested
-		FROM execution_runs WHERE status IN ('claimed','running') AND lease_until<=now()
-		ORDER BY lease_until,id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+	rows, err := tx.Query(ctx, `SELECT e.id::text,e.task_id::text,e.status,e.worker_id,e.fencing_token,e.attempt,e.max_attempts,e.retry_safe,e.idempotent,e.cancellation_requested,
+		EXISTS(SELECT 1 FROM tool_invocations i WHERE i.execution_id=e.id AND i.status IN ('running','waiting_approval'))
+		FROM execution_runs e WHERE e.status IN ('claimed','running') AND e.lease_until<=now()
+		ORDER BY e.lease_until,e.id FOR UPDATE OF e SKIP LOCKED LIMIT $1`, limit)
 	if err != nil {
 		return 0, fmt.Errorf("select expired executions: %w", err)
 	}
@@ -612,11 +625,12 @@ func (s *DurableExecutionStore) RecoverExpired(ctx context.Context, limit int, r
 		fence                         int64
 		attempt, max                  int
 		retrySafe, idempotent, cancel bool
+		hasActiveTool                 bool
 	}
 	var expiredRuns []expired
 	for rows.Next() {
 		var item expired
-		if err := rows.Scan(&item.id, &item.taskID, &item.status, &item.worker, &item.fence, &item.attempt, &item.max, &item.retrySafe, &item.idempotent, &item.cancel); err != nil {
+		if err := rows.Scan(&item.id, &item.taskID, &item.status, &item.worker, &item.fence, &item.attempt, &item.max, &item.retrySafe, &item.idempotent, &item.cancel, &item.hasActiveTool); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan expired execution: %w", err)
 		}
@@ -632,7 +646,9 @@ func (s *DurableExecutionStore) RecoverExpired(ctx context.Context, limit int, r
 		taskStatus := "waiting_external"
 		reason := "lease expired; execution outcome is uncertain"
 		class := execution.FailureUncertain
-		if item.cancel {
+		if item.hasActiveTool {
+			reason = "lease expired with an active Tool invocation; external outcome requires reconciliation"
+		} else if item.cancel {
 			reason = "lease expired after cancellation request; outcome is uncertain"
 		} else if item.retrySafe && item.status == execution.StatusClaimed {
 			next, taskStatus, reason, class = execution.StatusRetryWait, "retrying", "lease expired before executor start; no side effect occurred", execution.FailureSafeRetry
@@ -643,6 +659,58 @@ func (s *DurableExecutionStore) RecoverExpired(ctx context.Context, limit int, r
 		if _, err := tx.Exec(ctx, `UPDATE execution_runs SET status=$2,worker_id=NULL,lease_until=NULL,heartbeat_at=now(),available_at=CASE WHEN $2='retry_wait' THEN now()+$3::interval ELSE available_at END,
 			failure_reason=$4,error_class=$5,state_reason=$4,state_changed_at=now(),updated_at=now() WHERE id=$1`, item.id, next, retryDelay.String(), reason, class); err != nil {
 			return 0, fmt.Errorf("recover expired execution %s: %w", item.id, err)
+		}
+		if item.hasActiveTool {
+			approvalRows, err := tx.Query(ctx, `UPDATE approvals SET status='revoked' WHERE id IN (
+				SELECT approval_id FROM tool_invocations WHERE execution_id=$1 AND status='waiting_approval' AND approval_id IS NOT NULL)
+				AND status IN ('pending','approved') AND consumed_at IS NULL RETURNING id::text`, item.id)
+			if err != nil {
+				return 0, fmt.Errorf("revoke approvals for expired Tool invocations %s: %w", item.id, err)
+			}
+			var revokedApprovalIDs []string
+			for approvalRows.Next() {
+				var approvalID string
+				if err := approvalRows.Scan(&approvalID); err != nil {
+					approvalRows.Close()
+					return 0, fmt.Errorf("scan revoked Tool approval: %w", err)
+				}
+				revokedApprovalIDs = append(revokedApprovalIDs, approvalID)
+			}
+			if err := approvalRows.Err(); err != nil {
+				approvalRows.Close()
+				return 0, fmt.Errorf("iterate revoked Tool approvals: %w", err)
+			}
+			approvalRows.Close()
+			for _, approvalID := range revokedApprovalIDs {
+				if err := recordMutation(ctx, tx, "recovery-scanner", "approval.revoked", "approvals", approvalID, map[string]any{"execution_id": item.id, "reason": reason}); err != nil {
+					return 0, err
+				}
+			}
+			invocationRows, err := tx.Query(ctx, `UPDATE tool_invocations SET status=CASE WHEN status='waiting_approval' THEN 'cancelled' ELSE 'unknown' END,
+				error_class='lease_expired',failure_reason=$2,completed_at=now(),updated_at=now() WHERE execution_id=$1 AND status IN ('running','waiting_approval') RETURNING id::text,status`, item.id, reason)
+			if err != nil {
+				return 0, fmt.Errorf("mark expired Tool invocations unknown %s: %w", item.id, err)
+			}
+			type recoveredInvocation struct{ id, status string }
+			var recoveredInvocations []recoveredInvocation
+			for invocationRows.Next() {
+				var invocationID, invocationStatus string
+				if err := invocationRows.Scan(&invocationID, &invocationStatus); err != nil {
+					invocationRows.Close()
+					return 0, fmt.Errorf("scan recovered Tool invocation: %w", err)
+				}
+				recoveredInvocations = append(recoveredInvocations, recoveredInvocation{id: invocationID, status: invocationStatus})
+			}
+			if err := invocationRows.Err(); err != nil {
+				invocationRows.Close()
+				return 0, fmt.Errorf("iterate recovered Tool invocations: %w", err)
+			}
+			invocationRows.Close()
+			for _, invocation := range recoveredInvocations {
+				if err := recordMutation(ctx, tx, "recovery-scanner", "tool.invocation_"+invocation.status, "tool_invocations", invocation.id, map[string]any{"execution_id": item.id, "reason": reason}); err != nil {
+					return 0, err
+				}
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE tasks SET status=$2,updated_at=now() WHERE id=$1 AND status IN ('running','retrying')`, item.taskID, taskStatus); err != nil {
 			return 0, fmt.Errorf("recover expired task %s: %w", item.taskID, err)
@@ -680,6 +748,10 @@ func (s *DurableExecutionStore) Get(ctx context.Context, id string) (execution.R
 		return execution.Run{}, fmt.Errorf("get durable execution: %w", err)
 	}
 	return run, nil
+}
+
+func (s *DurableExecutionStore) ResumeApproval(ctx context.Context, userID, approvalID string) error {
+	return (&Postgres{pool: s.pool}).ResumeApproval(ctx, userID, approvalID)
 }
 
 func (s *DurableExecutionStore) VerifiedTaskIDs(ctx context.Context, goalID string) ([]string, error) {

@@ -332,6 +332,71 @@ paths:
           description: Agent profile
         '404':
           description: Agent not found
+  /api/v1/tools:
+    get:
+      summary: List registered Tool metadata (registration does not grant permission)
+      responses:
+        '200':
+          description: Tool metadata and operational state
+  /api/v1/tools/{provider}/{tool}/{version}:
+    get:
+      summary: Get the exact registered Tool version and schema
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: {type: string}
+        - name: tool
+          in: path
+          required: true
+          schema: {type: string}
+        - name: version
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Exact Tool version metadata
+        '404':
+          description: Tool version not found
+  /api/v1/mcp/servers:
+    get:
+      summary: List configured MCP server lifecycle/health state (credentials excluded)
+      responses:
+        '200':
+          description: MCP server status list
+  /api/v1/mcp/servers/{id}/enable:
+    post:
+      summary: Enable an operator-configured MCP server
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '202':
+          description: Server connection scheduled
+  /api/v1/mcp/servers/{id}/disable:
+    post:
+      summary: Disable an MCP server and its registered Tools
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '202':
+          description: Server disabled
+  /api/v1/mcp/servers/{id}/reconnect:
+    post:
+      summary: Reconnect and rediscover an enabled MCP server
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '202':
+          description: Reconnection scheduled
+  /api/v1/mcp/servers/{id}:
+    delete:
+      summary: Unregister an MCP server and disable its Tools until Core restart/config update
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: Server removed from the current runtime
   /api/v1/nodes:
     get:
       summary: List registered nodes and current health state

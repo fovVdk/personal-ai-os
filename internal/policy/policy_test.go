@@ -14,6 +14,7 @@ func TestEvaluateAutonomyRules(t *testing.T) {
 		{name: "A1 allowed", request: Request{ToolID: "note", Action: "create", Level: A1, ToolAllowed: true}, want: Allow},
 		{name: "A2 requires configured approval", request: Request{ToolID: "message", Action: "send", Level: A2, ToolAllowed: true, ApprovalRequired: true}, want: RequireApproval},
 		{name: "A3 always requires approval", request: Request{ToolID: "door", Action: "unlock", Level: A3, ToolAllowed: true}, want: RequireApproval},
+		{name: "high-risk tool requires approval regardless of autonomy", request: Request{ToolID: "critical", Action: "operate", Level: A0, RiskLevel: 3, ToolAllowed: true}, want: RequireApproval},
 		{name: "not allowlisted denied", request: Request{ToolID: "shell", Action: "run", Level: A0}, want: Deny},
 	}
 	for _, test := range tests {

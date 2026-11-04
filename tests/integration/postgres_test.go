@@ -34,7 +34,9 @@ import (
 	"personal-ai-os/internal/policy"
 	"personal-ai-os/internal/supervisor"
 	"personal-ai-os/internal/task"
+	toolgateway "personal-ai-os/internal/tool/gateway"
 	toolpolicy "personal-ai-os/internal/tool/policy"
+	toolregistry "personal-ai-os/internal/tool/registry"
 	"personal-ai-os/migrations"
 	paierrors "personal-ai-os/pkg/errors"
 )
@@ -98,6 +100,8 @@ func TestPostgresMigrationsFromEmptyDatabaseAndIdempotency(t *testing.T) {
 		"0006_nodes.sql",
 		"0007_model_usage.sql",
 		"0008_durable_execution_runtime.sql",
+		"0009_tool_fabric.sql",
+		"0010_goal_tool_usage.sql",
 	}
 	rows, err := pool.Query(ctx, "SELECT version,checksum FROM schema_migrations ORDER BY version")
 	if err != nil {
@@ -135,12 +139,87 @@ func TestPostgresMigrationsFromEmptyDatabaseAndIdempotency(t *testing.T) {
 	t.Logf("pgvector extension version: %s", vectorVersion)
 	assertMigrationFailureRollsBack(t, ctx, pool, os.Getenv("PAIOS_TEST_DATABASE_URL"))
 
-	for _, index := range []string{"goals_owner_status_idx", "tasks_goal_status_idx", "execution_runs_recovery_idx", "memories_search_idx", "knowledge_chunks_search_idx", "nodes_status_type_idx"} {
+	for _, index := range []string{"goals_owner_status_idx", "tasks_goal_status_idx", "execution_runs_recovery_idx", "memories_search_idx", "knowledge_chunks_search_idx", "nodes_status_type_idx", "tool_invocations_recovery_idx", "approvals_execution_context_idx"} {
 		var exists bool
 		if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1)", index).Scan(&exists); err != nil || !exists {
 			t.Errorf("expected index %s, exists=%v err=%v", index, exists, err)
 		}
 	}
+}
+
+func TestPostgresToolInvocationApprovalAndIdempotency(t *testing.T) {
+	pool, repository := integrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := migrations.Apply(ctx, pool); err != nil { t.Fatalf("apply migrations: %v", err) }
+	goalItem, err := repository.Create(ctx, goal.Goal{OwnerID:testOwnerID, Title:uniqueLabel("tool-goal"), Priority:3, Status:goal.Active})
+	if err != nil { t.Fatalf("create Goal: %v", err) }
+	taskItem, err := repository.Tasks().Create(ctx, task.Task{GoalID:goalItem.ID, Title:uniqueLabel("tool-task"), Priority:3, Status:task.Ready})
+	if err != nil { t.Fatalf("create Task: %v", err) }
+	durable := store.NewDurableExecutionStore(pool)
+	enqueued, _, err := durable.Enqueue(ctx, newExecutionEnqueueRequest(taskItem.ID, "tool-test-agent", uniqueLabel("tool-run"), []byte(`{"kind":"tool-invocation-test"}`), 2, true))
+	if err != nil { t.Fatalf("enqueue execution: %v", err) }
+	claimed, err := durable.Claim(ctx, "tool-test-worker", 30*time.Second)
+	if err != nil || claimed.ID != enqueued.ID { t.Fatalf("claim execution=%+v err=%v", claimed, err) }
+	lease := execution.Lease{ExecutionID:claimed.ID, WorkerID:claimed.WorkerID, Fencing:claimed.FencingToken, LeaseUntil:claimed.LeaseUntil}
+	if err := durable.Start(ctx, lease); err != nil { t.Fatalf("start execution: %v", err) }
+	request := toolgateway.Request{GoalID:goalItem.ID, TaskID:taskItem.ID, ExecutionID:claimed.ID, StepID:"step-1", AgentID:"tool-test-agent",
+		Identity:toolregistry.Identity{ProviderID:"builtin", ToolID:"filesystem.read", Version:"v1"}, IdempotencyKey:"integration-key", Lease:lease, Arguments:json.RawMessage(`{"path":"readme.txt"}`)}
+	definition := toolregistry.Definition{Identity:request.Identity, RiskLevel:1}
+	inputHash := strings.Repeat("a", 64)
+	invocations := store.NewPostgres(pool)
+	requested, err := invocations.RequestApproval(ctx, request, definition, inputHash)
+	if err != nil || requested.Status != "waiting_approval" || requested.ApprovalID == "" { t.Fatalf("request approval=%+v err=%v", requested, err) }
+	if err := durable.Fail(ctx, lease, execution.FailureApprovalNeeded, "Tool approval requested", 0); err != nil { t.Fatalf("persist waiting-approval execution: %v", err) }
+	approvalItem, err := repository.Approvals().Decide(ctx, testOwnerID, requested.ApprovalID, approval.Approved, time.Now().UTC())
+	if err != nil || approvalItem.Status != approval.Approved { t.Fatalf("approve invocation=%+v err=%v", approvalItem, err) }
+	if err := invocations.ResumeApproval(ctx, testOwnerID, requested.ApprovalID); err != nil { t.Fatalf("resume approved execution: %v", err) }
+	resumed, err := durable.Claim(ctx, "tool-test-worker-resumed", 30*time.Second)
+	if err != nil || resumed.ID != claimed.ID || resumed.FencingToken <= claimed.FencingToken { t.Fatalf("reclaim approved execution=%+v err=%v", resumed, err) }
+	lease = execution.Lease{ExecutionID:resumed.ID, WorkerID:resumed.WorkerID, Fencing:resumed.FencingToken, LeaseUntil:resumed.LeaseUntil}
+	if err := durable.Start(ctx, lease); err != nil { t.Fatalf("start approved execution continuation: %v", err) }
+	request.Lease = lease
+	request.ApprovalID = requested.ApprovalID
+	changedContext := request
+	changedContext.StepID = "different-step"
+	if _, err := invocations.Begin(ctx, changedContext, definition, inputHash); err == nil { t.Fatal("approval bound to a different Step must be rejected") }
+	start := make(chan struct{})
+	type beginResult struct { reservation toolgateway.Reservation; err error }
+	results := make(chan beginResult, 2)
+	for i:=0;i<2;i++ { go func(){ <-start; reservation,beginErr:=invocations.Begin(ctx,request,definition,inputHash);results<-beginResult{reservation:reservation,err:beginErr} }() }
+	close(start)
+	first,second:=<-results,<-results
+	var started toolgateway.Reservation
+	if first.err!=nil||second.err!=nil { t.Fatalf("concurrent begin errors: %v / %v",first.err,second.err) }
+	if !first.reservation.Replay&&second.reservation.Replay { started=first.reservation } else if first.reservation.Replay&&!second.reservation.Replay { started=second.reservation } else { t.Fatalf("expected one invocation winner and one replay: %+v / %+v",first.reservation,second.reservation) }
+	if started.Status!="running" { t.Fatalf("started invocation=%+v",started) }
+	var consumedAt *time.Time
+	if err := pool.QueryRow(ctx, "SELECT consumed_at FROM approvals WHERE id=$1", request.ApprovalID).Scan(&consumedAt); err != nil || consumedAt == nil { t.Fatalf("approval consumption timestamp=%v err=%v", consumedAt, err) }
+	if err := invocations.Complete(ctx, started, json.RawMessage(`{"ok":true}`)); err != nil { t.Fatalf("complete invocation: %v", err) }
+	replayed, err := invocations.Begin(ctx, request, definition, inputHash)
+	var replayResult map[string]bool
+	decodeReplayErr := json.Unmarshal(replayed.Result, &replayResult)
+	if err != nil || decodeReplayErr != nil || !replayed.Replay || replayed.Status != "succeeded" || !replayResult["ok"] { t.Fatalf("replay=%+v err=%v decode=%v", replayed, err, decodeReplayErr) }
+	if _, err := invocations.Begin(ctx, request, definition, strings.Repeat("b", 64)); err == nil { t.Fatal("same idempotency key with changed hash must be rejected") }
+	var auditCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM audit_records WHERE resource='tool_invocations' AND resource_id=$1", started.InvocationID).Scan(&auditCount); err != nil || auditCount < 2 { t.Fatalf("invocation audit count=%d err=%v", auditCount, err) }
+	rejectedRequest := request
+	rejectedRequest.IdempotencyKey = "rejected-approval"
+	rejected, err := invocations.RequestApproval(ctx, rejectedRequest, definition, strings.Repeat("d", 64))
+	if err != nil { t.Fatalf("request second approval: %v", err) }
+	if _, err := repository.Approvals().Decide(ctx, testOwnerID, rejected.ApprovalID, approval.Rejected, time.Now().UTC()); err != nil { t.Fatalf("reject second approval: %v", err) }
+	rejectedRequest.ApprovalID = rejected.ApprovalID
+	if _, err := invocations.Begin(ctx, rejectedRequest, definition, strings.Repeat("d", 64)); err == nil { t.Fatal("rejected approval must not start a Tool invocation") }
+	request.ApprovalID = ""
+	request.IdempotencyKey = "active-before-crash"
+	active, err := invocations.Begin(ctx, request, definition, strings.Repeat("c", 64))
+	if err != nil || active.Status != "running" { t.Fatalf("begin pre-crash Tool invocation=%+v err=%v", active, err) }
+	if _, err := pool.Exec(ctx, "UPDATE execution_runs SET lease_until=now()-interval '1 second' WHERE id=$1", claimed.ID); err != nil { t.Fatalf("expire execution lease: %v", err) }
+	if recovered, err := durable.RecoverExpired(ctx, 10, time.Second); err != nil || recovered != 1 { t.Fatalf("recover expired Tool execution count=%d err=%v", recovered, err) }
+	var invocationStatus, executionStatus string
+	if err := pool.QueryRow(ctx, "SELECT i.status,e.status FROM tool_invocations i JOIN execution_runs e ON e.id=i.execution_id WHERE i.id=$1", active.InvocationID).Scan(&invocationStatus, &executionStatus); err != nil { t.Fatal(err) }
+	if invocationStatus != "unknown" || executionStatus != string(execution.StatusUnknown) { t.Fatalf("recovered invocation=%s execution=%s", invocationStatus, executionStatus) }
+	cleanupIntegrationRows(t, ctx, pool, []string{goalItem.ID}, []string{taskItem.ID}, nil, nil, nil, []string{requested.ApprovalID, rejected.ApprovalID})
 }
 
 func assertMigrationFailureRollsBack(t *testing.T, ctx context.Context, adminPool *pgxpool.Pool, databaseURL string) {
@@ -201,10 +280,10 @@ func assertMigrationFailureRollsBack(t *testing.T, ctx context.Context, adminPoo
 		t.Fatalf("apply migrations after removing injected failure: %v", err)
 	}
 	var versionCount int
-	if err := migrationPool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versionCount); err != nil || versionCount != 8 {
-		t.Fatalf("successful retry migration count=%d err=%v, want 8", versionCount, err)
+	if err := migrationPool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versionCount); err != nil || versionCount != 10 {
+		t.Fatalf("successful retry migration count=%d err=%v, want 10", versionCount, err)
 	}
-	t.Log("injected migration failure rolled back both schema changes and version rows; clean retry applied all eight migrations")
+	t.Log("injected migration failure rolled back both schema changes and version rows; clean retry applied all ten migrations")
 }
 
 func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
@@ -1157,6 +1236,20 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM event_outbox WHERE aggregate_id=ANY($1::uuid[])", allIDs); err != nil {
 			t.Errorf("clean integration outbox fixtures: %v", err)
+			return
+		}
+	}
+	if len(taskIDs) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM audit_records WHERE resource='tool_invocations' AND resource_id IN (SELECT id::text FROM tool_invocations WHERE task_id::text=ANY($1::text[]))`, taskIDs); err != nil {
+			t.Errorf("clean integration Tool invocation audit fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM event_outbox WHERE aggregate_type='tool_invocations' AND aggregate_id IN (SELECT id FROM tool_invocations WHERE task_id::text=ANY($1::text[]))`, taskIDs); err != nil {
+			t.Errorf("clean integration Tool invocation outbox fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM tool_invocations WHERE task_id::text=ANY($1::text[])", taskIDs); err != nil {
+			t.Errorf("clean integration Tool invocation fixtures: %v", err)
 			return
 		}
 	}

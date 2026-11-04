@@ -32,6 +32,7 @@ type Request struct {
 	ToolID           string
 	Action           string
 	Level            AutonomyLevel
+	RiskLevel        int
 	ToolAllowed      bool
 	ApprovalRequired bool
 }
@@ -47,13 +48,16 @@ func Evaluate(request Request) (Result, error) {
 	if request.Level < A0 || request.Level > A3 {
 		return Result{}, fmt.Errorf("%w: %d", ErrInvalidLevel, request.Level)
 	}
+	if request.RiskLevel < 0 || request.RiskLevel > 3 {
+		return Result{Decision: Deny, Reason: "tool risk level is invalid"}, nil
+	}
 	if request.ToolID == "" || request.Action == "" {
 		return Result{Decision: Deny, Reason: "tool and action are required"}, nil
 	}
 	if !request.ToolAllowed {
 		return Result{Decision: Deny, Reason: "tool is not explicitly allowed"}, nil
 	}
-	if request.Level == A3 || request.ApprovalRequired {
+	if request.Level == A3 || request.RiskLevel == 3 || request.ApprovalRequired {
 		return Result{Decision: RequireApproval, Reason: "human approval is required"}, nil
 	}
 	return Result{Decision: Allow, Reason: "permitted by autonomy policy"}, nil

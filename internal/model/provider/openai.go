@@ -24,11 +24,27 @@ type OpenAICompatible struct {
 	ProviderName string
 }
 type chatRequest struct {
-	Model       string            `json:"model"`
-	Messages    []gateway.Message `json:"messages"`
-	Tools       []map[string]any  `json:"tools,omitempty"`
-	Temperature float64           `json:"temperature,omitempty"`
-	MaxTokens   int               `json:"max_tokens,omitempty"`
+	Model       string           `json:"model"`
+	Messages    []chatMessage    `json:"messages"`
+	Tools       []map[string]any `json:"tools,omitempty"`
+	Temperature float64          `json:"temperature,omitempty"`
+	MaxTokens   int              `json:"max_tokens,omitempty"`
+}
+
+type chatMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type chatToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 type chatResponse struct {
 	Model   string `json:"model"`
@@ -95,7 +111,18 @@ func (p OpenAICompatible) Complete(ctx context.Context, request gateway.Request)
 		}
 		tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": definition.Name, "description": definition.Description, "parameters": schema}})
 	}
-	payload, err := json.Marshal(chatRequest{Model: request.Model, Messages: request.Messages, Tools: tools, Temperature: request.Temperature, MaxTokens: request.MaxTokens})
+	messages := make([]chatMessage, 0, len(request.Messages))
+	for _, message := range request.Messages {
+		converted := chatMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID}
+		for _, call := range message.ToolCalls {
+			convertedCall := chatToolCall{ID: call.ID, Type: "function"}
+			convertedCall.Function.Name = call.Name
+			convertedCall.Function.Arguments = string(call.Arguments)
+			converted.ToolCalls = append(converted.ToolCalls, convertedCall)
+		}
+		messages = append(messages, converted)
+	}
+	payload, err := json.Marshal(chatRequest{Model: request.Model, Messages: messages, Tools: tools, Temperature: request.Temperature, MaxTokens: request.MaxTokens})
 	if err != nil {
 		return gateway.Response{}, fmt.Errorf("encode model request: %w", err)
 	}

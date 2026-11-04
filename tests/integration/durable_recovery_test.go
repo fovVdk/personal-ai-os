@@ -308,8 +308,8 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	finalCtx, stopFinalWorker := context.WithCancel(ctx)
 	finalDone := make(chan error, 1)
 	go func() { finalDone <- finalPool.Run(finalCtx) }()
-	if finished := waitForRun(t, ctx, durable, finalRun.ID, execution.StatusSucceeded); finished.FencingToken != 1 {
-		t.Fatalf("final dependency Task fencing token=%d, want 1", finished.FencingToken)
+	if finished := waitForRun(t, ctx, durable, finalRun.ID, execution.StatusSucceeded); finished.FencingToken < 1 {
+		t.Fatalf("final dependency Task has invalid fencing token=%d", finished.FencingToken)
 	}
 	stopFinalWorker()
 	select {

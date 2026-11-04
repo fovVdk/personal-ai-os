@@ -129,6 +129,12 @@ func (s *Server) decideApproval(status approval.Status) http.HandlerFunc {
 			s.internalError(w, r, "decide approval", err)
 			return
 		}
+		if status == approval.Approved && item.ExecutionID != "" && s.DurableExecutions != nil {
+			if err := s.DurableExecutions.ResumeApproval(r.Context(), defaultOwnerID, item.ID); err != nil {
+				writeError(w, r, http.StatusConflict, "approval_resume_conflict", "approval was recorded but its execution is no longer resumable")
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, item)
 	}
 }

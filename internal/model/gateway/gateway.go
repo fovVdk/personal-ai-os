@@ -14,8 +14,11 @@ import (
 var ErrProviderUnavailable = errors.New("model provider unavailable")
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
 }
 type Request struct {
 	Model       string           `json:"model"`

@@ -9,8 +9,8 @@ Personal AI OS is a local-first Go modular monolith with Goals as the top-level 
 - **Goal-first / 目标优先：** Goal、Task 与执行记录各有独立 UUID 和持久化生命周期；聊天会话不是任务身份。
 - **Go Core 控制 / Core owns control:** Go 服务控制领域状态、策略、审批和执行账本。模型及 Agent 只能提供候选计划/结果，不能直接改数据库或授予权限。
 - **Evidence-gated completion / 证据门控完成：** Goal 完成请求必须携带可追溯 Evidence。Mock Agent 的结果标记为未验证，不能伪装成任务完成。
-- **Policy before side effects / 副作用前先鉴权：** A0–A3 Policy 与参数哈希审批门在工具调用前判断。当前没有启用的副作用工具执行器，所以审批 API 管理授权记录，但尚未连接真实工具执行流程。
-- **Persisted state / 状态持久化：** PostgreSQL 保存 Goal、Task、审批、执行结果、Evidence、Outbox、审计、Memory、Knowledge、Node 和模型用量记录。
+- **Policy before side effects / 副作用前先鉴权：** Tool Gateway 使用可信授权解析器和 A0–A3 Policy；审批绑定 Tool 版本、规范化参数哈希和 Execution/Step/Agent 上下文，并一次性消费。当前仅注册只读工具，不启用通用副作用工具。
+- **Persisted state / 状态持久化：** PostgreSQL 保存 Goal、Task、审批、执行结果、Tool Invocation、Evidence、Outbox、审计、Memory、Knowledge、Node 和模型用量记录。
 - **Modular monolith / 模块化单体：** 当前是一个 Go HTTP 程序；领域层依赖本地接口，数据库和 Provider 由适配器实现，避免为 V1 过早拆分服务。
 
 ## 架构与依赖方向 | Architecture
@@ -25,7 +25,7 @@ Goal · Task · Planner · Supervisor · Policy · Approval · Agent Runtime · 
 PostgreSQL adapters · Model Providers · structured logger
 ```
 
-Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/Model proposal → Execution record → Evidence`。目前 Subgoal/Milestone 仅由 Goal 的父子关系和计划结构预留表达，不存在独立完整的 Subgoal/Milestone 管理 API；Tool 和 MCP 也尚无可调用实现。
+Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/Model proposal → Execution record → Evidence`。目前 Subgoal/Milestone 仅由 Goal 的父子关系和计划结构预留表达，不存在独立完整的 Subgoal/Milestone 管理 API。MCP Client 支持 operator-configured Streamable HTTP 和 stdio，并将发现的工具注册到现有 Gateway；MCP Tool 默认 A3、非幂等并需要审批。
 
 ### 模块职责与当前状态 | Modules and status
 
@@ -35,15 +35,16 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | `internal/goal`, `internal/task` | 领域模型、校验、状态转换、Repository 契约 | 已实现核心状态规则及 PostgreSQL 持久化 |
 | `internal/planner` | 结构化计划、JSON 校验、依赖 DAG 校验 | Mock 与 Model Planner 已接入 |
 | `internal/supervisor` | 预算内规划/任务调度、执行账本及恢复协调 | 已实现有界 turn；没有后台恢复 worker |
-| `internal/policy`, `internal/approval`, `internal/tool/policy` | 自主等级决策与参数绑定审批门 | 策略与审批门已实现并测试；没有生产工具执行器 |
-| `internal/agent/runtime`, `registry` | 框架无关 Agent 接口和注册信息 | 已实现 Mock General/Research/Planning Agent；无 Eino Adapter |
-| `internal/model/gateway`, `provider` | 统一模型契约、预算/Schema 校验及 Provider | Mock、OpenAI-compatible、Ollama；工具调用仅解析为提议 |
+| `internal/policy`, `internal/approval`, `internal/tool/gateway` | 自主等级决策、精确审批与统一工具调用入口 | 可信授权→Gateway→持久 Invocation；不确定结果进入 `unknown` |
+| `internal/tool/registry`, `internal/tool/builtin`, `internal/tool/mcp` | 版本化 Tool Registry、原生工具与官方 MCP Client | Native 工具和 Streamable HTTP/stdio MCP Adapter；MCP Server 定义/Schema 不可信且默认 A3 |
+| `internal/agent/runtime`, `registry`, `adapter` | 框架无关 Agent 接口和注册信息 | Mock Agent 保持未验证；非 Mock Provider 使用受限 ModelAgent，通过 Core ToolCaller 执行结构化 Tool Call；无 Eino Adapter |
+| `internal/model/gateway`, `provider` | 统一模型契约、预算/Schema 校验及 Provider | Mock、OpenAI-compatible、Ollama；支持 assistant tool_calls 和关联 Tool Result 往返 |
 | `internal/memory` | 带来源/置信度的记忆模型与 API | PostgreSQL CRUD、软删除和全文搜索 |
 | `internal/knowledge` | 文档、内容哈希、分块与引用 | 文本导入及 PostgreSQL 全文检索；未生成 Embedding |
 | `internal/node` | 节点身份、能力、状态 | 注册/查询 API 与存储；无独立心跳 HTTP 路由/过期 worker |
 | `internal/app/store` | PostgreSQL Repository、事务及持久化适配器 | 已实现当前切片的适配器 |
 | `internal/event`, `internal/audit` | 事件与审计领域边界 | Goal/Task/审批写入事务性 Outbox 和审计记录；无发布 worker/查询 API |
-| `internal/identity`, `internal/tool/mcp`, `internal/observability` | 扩展边界 | 多用户/RBAC、MCP、OpenTelemetry 尚未完整实现；认证当前为共享 API Key |
+| `internal/identity`, `internal/observability` | 扩展边界 | 多用户/RBAC、OpenTelemetry 尚未完整实现；认证当前为共享 API Key |
 
 领域包位于 `internal/`，不能被外部 Go 模块直接导入。`pkg/contracts/` 预留稳定跨进程契约，不应将内部领域结构直接用作 wire schema。Framework/Provider 特定类型应留在 Adapter 边界，不能渗透到 Goal、Task、Policy 等领域模型。
 
@@ -53,12 +54,12 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 2. HTTP 请求经 Request ID、请求日志、恢复、超时和 API Key 中间件处理。`/health` 检查进程存活；`/ready` 检查数据库连接。
 3. Planner 生成结构化计划。模型输出使用严格 JSON 解码并验证字段、Goal 归属、预算和依赖 DAG；计划中的任务通过一个数据库事务创建。
 4. Supervisor 对单次 turn 施加步骤数、模型调用、Token、工具调用、成本、重试和运行时间预算，并优先执行依赖已满足的任务。模型或 Mock Agent 不能绕过 Go Core 状态管理。
-5. 执行结果、Evidence、Task 状态、审计和 Outbox 由 Go Core/存储适配器持久化。未验证结果不会冒充完成。恢复逻辑在下一次相关 Supervisor turn 中检查部分 `running`/`retrying` 状态及 Evidence 已保存但 Task 状态尚未更新的窗口；当前没有常驻恢复进程或外部副作用前的持久幂等 claim。
-6. 对需要审批的工具动作，授权应绑定 Tool、Action、具体参数哈希和有效期。当前 API 可创建/批准/拒绝请求，策略门可验证匹配审批，但尚未存在实际的 side-effect tool runner。
+5. Durable Worker 使用 Lease/Heartbeat/Fencing 和 Step 幂等执行 Agent。Agent 只获得 Core 注入的结构化 Tool Caller，不会访问 Handler；Tool Gateway 再校验授权、Schema、Approval、租约与持久幂等。
+6. Tool Invocation 成功结果与 Audit/Outbox 事务持久化。进程/Lease 在调用结果未知时会标记 `unknown`，不盲目重放；未知外部效果仍需人工核实，系统不承诺任意外部 API exactly-once。
 
 ## PostgreSQL 数据设计 | Persistence
 
-迁移文件按 `0001`–`0007` 顺序嵌入二进制，应用时使用 PostgreSQL advisory lock、事务及迁移内容校验和。迁移只向前演进，不应手工删除版本记录或在生产库上试验。
+迁移文件按 `0001`–`0010` 顺序嵌入二进制，应用时使用 PostgreSQL advisory lock、事务及迁移内容校验和。迁移只向前演进，不应手工删除版本记录或在生产库上试验。
 
 | Migration | 主要对象 |
 | --- | --- |
@@ -69,6 +70,9 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | `0005_task_attempts.sql` | Task 持久化尝试计数 |
 | `0006_nodes.sql` | `nodes` |
 | `0007_model_usage.sql` | 按 Goal 累计模型调用和 Token 的 `model_usage` 账本 |
+| `0008_durable_execution_runtime.sql` | Durable Execution 的 Lease/Fencing、Checkpoint、Run/Step 幂等和状态历史 |
+| `0009_tool_fabric.sql` | `tool_invocations` 持久记录及审批 Tool Version/Execution/Step/Agent/一次性消费绑定 |
+| `0010_goal_tool_usage.sql` | 扩展 Goal 用量账本，持久化 Core 观察到的 Tool Call 数量用于跨轮预算 |
 
 主键使用 UUID，业务时间使用 `timestamptz`，可扩展字段使用 JSONB。Goal/Task 创建、修改和转换以及审批决策通过事务写入相关审计/Outbox 记录。Knowledge 和 Memory 当前使用 PostgreSQL 全文检索，不是向量检索。
 
@@ -91,6 +95,11 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | GET | `/api/v1/approvals/{id}` | 查询审批 |
 | POST | `/api/v1/approvals/{id}/approve`, `/reject` | 决策审批 |
 | GET | `/api/v1/agents`, `/api/v1/agents/{id}` | 列出/查看注册的 Mock Agent |
+| GET | `/api/v1/tools` | 列出已注册 Tool 元数据及健康/启用状态；不返回 Handler，也不授予权限 |
+| GET | `/api/v1/tools/{provider}/{tool}/{version}` | 查看精确 Tool 版本和 Schema |
+| GET | `/api/v1/mcp/servers` | 查询 MCP Server 连接、版本及发现状态，不返回凭据 |
+| POST | `/api/v1/mcp/servers/{id}/enable`, `/disable`, `/reconnect` | 控制已配置 MCP Server 生命周期 |
+| DELETE | `/api/v1/mcp/servers/{id}` | 注销当前运行实例并禁用其 Tool |
 | POST/GET | `/api/v1/memories` | 创建/列出记忆 |
 | GET/PATCH/DELETE | `/api/v1/memories/{id}` | 读取/修改/软删除记忆 |
 | POST | `/api/v1/memories/search` | 关键词全文搜索 |
@@ -99,11 +108,11 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | GET | `/api/v1/nodes`, `/api/v1/nodes/{id}` | 列出/读取节点 |
 | POST | `/api/v1/nodes/register` | 注册节点 |
 
-当前没有 Task PATCH、工具清单/调用 API、Node 心跳 API、OpenAPI UI 或完整 Subgoal/Milestone CRUD。
+当前没有 Task PATCH、用户侧 Tool Invocation API、Node 心跳 API、OpenAPI UI 或完整 Subgoal/Milestone CRUD。工具仅通过 Durable Agent Runtime 注入的 Gateway 调用，不提供绕过 Worker/Lease 的 HTTP dispatch 路由。
 
 ## 配置与安全 | Configuration and security
 
-运行时**读取环境变量**；`configs/config.example.yaml` 仅作参考模板，当前不由程序解析。`.env.example` 也只是模板。`DATA_DIR` 和 `FILE_STORAGE_DIR` 当前被读取为配置值，但文本 Knowledge 内容存于数据库，尚无文件存储 Adapter。
+运行时**读取环境变量**；`configs/config.example.yaml` 仅作参考模板，当前不由程序解析。`.env.example` 也只是模板。`DATA_DIR` 和 `FILE_STORAGE_DIR` 当前被读取为配置值；`MCP_SERVERS_JSON` 只接受运维配置，不接收 Agent/API 提供的启动命令。
 
 | 环境变量 | 默认值/用途 |
 | --- | --- |
@@ -114,7 +123,9 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 | `MODEL_PROVIDER` | `mock`；另支持 `openai-compatible`、`ollama` |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL_NAME` | OpenAI-compatible Provider 配置；Secret 只从环境变量读取 |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` |
-| `DATA_DIR`, `FILE_STORAGE_DIR` | 配置占位；目前未被文件存储流程使用 |
+| `DATA_DIR`, `FILE_STORAGE_DIR` | Native `filesystem.read/list` 的授权目录是 `FILE_STORAGE_DIR`；仅当目录已存在时才注册 |
+| `HTTP_FETCH_ALLOWED_HOSTS` | 逗号分隔的精确主机白名单；未配置时不注册 `http.fetch`。仅 HTTP(S)/公有解析地址、无重定向、响应限 1 MiB |
+| `MCP_SERVERS_JSON` | 操作员提供的严格 JSON Server 配置数组；留空时不启动 MCP Server。HTTP 需 HTTPS/精确 host allowlist；stdio 需绝对命令、独立 argv、工作目录和显式环境 |
 | `MAX_AGENT_STEPS`, `MAX_MODEL_CALLS`, `MAX_MODEL_TOKENS`, `MAX_TOOL_CALLS` | Supervisor 单次 Goal turn 预算 |
 | `MAX_EXECUTION_SECONDS`, `MAX_EXECUTION_COST`, `MAX_RETRIES` | 执行时间、成本和重试预算 |
 | `POSTGRES_PASSWORD` | Compose 数据库密码；请修改默认值 |
@@ -124,7 +135,7 @@ Goal 的规划/执行关系为 `Goal → structured Plan → Task DAG → Agent/
 
 ## 本地运行 | Local development
 
-Requirements: Go 1.22+（`go.mod` 语言目标为 1.22）、Docker Compose、PostgreSQL 16 + pgvector。依赖版本固定在 `go.mod`/`go.sum`。若仓库位于 GOPATH 目录中，Makefile 使用外部临时 GOPATH 确保启用 Go Modules。
+Requirements: Go 1.25+（`go.mod` 最低版本为 1.25，官方 MCP SDK v1.8.0 要求）、Docker Compose、PostgreSQL 16 + pgvector。依赖版本固定在 `go.mod`/`go.sum`。若仓库位于 GOPATH 目录中，Makefile 使用外部临时 GOPATH 确保启用 Go Modules。
 
 1. 从 `.env.example` 复制为 `.env`，修改 `POSTGRES_PASSWORD`；如需 API Key，配置至少 32 字符的 `PAIOS_API_KEY`。
 2. `make docker-up` 启动 PostgreSQL；Compose 需先拉取 `pgvector/pgvector:pg16` 镜像。
@@ -132,7 +143,7 @@ Requirements: Go 1.22+（`go.mod` 语言目标为 1.22）、Docker Compose、Pos
 4. `make run` 启动 API；使用 Mock Model 不需云端凭据。
 5. 访问 `http://localhost:8080/health` 和 `http://localhost:8080/ready`。
 
-Make targets：`make build`、`make test`、`make vet`、`make fmt`、`make run`、`make migrate`、`make docker-up`、`make docker-down`、`make db-test-up`、`make db-test-down`、`make db-test-clean`、`make test-integration`。`make run` 与 `make migrate` 需要 PostgreSQL；`make docker-*` 需要 Docker，并要求先创建 `.env`。Phase 9 的隔离数据库验收结果见 [docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)。
+Make targets：`make build`、`make build-arm64`、`make test`、`make vet`、`make fmt`、`make run`、`make migrate`、`make docker-up`、`make docker-down`、`make db-test-up`、`make db-test-down`、`make db-test-clean`、`make test-integration`。GitHub Actions [Go CI workflow](.github/workflows/ci.yml) pins Go 1.25.0 exactly, asserts the running toolchain, runs race/PostgreSQL acceptance, and separately tests stdio subprocess recovery and darwin/arm64 builds. `make run` 与 `make migrate` 需要 PostgreSQL；`make docker-*` 需要 Docker，并要求先创建 `.env`。Phase 9 的隔离数据库验收结果见 [docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)。
 
 ## API 快速示例 | API example
 
@@ -158,11 +169,11 @@ Mock 配置返回确定性结构化计划；配置真实 Provider 时 Planner �
 
 ## 测试、验证与已知限制 | Tests and limitations
 
-单元测试覆盖 Goal/Task 状态转换、Evidence 门控、A0–A3 Policy、审批哈希和过期、重试/并发幂等基础能力、工具审批门、配置校验、HTTP Handler、计划 DAG、Provider/Tool-call Schema、Knowledge 分块等。PostgreSQL 集成测试存在于 `tests/integration/`，只有设置专用 `PAIOS_TEST_DATABASE_URL` 时才运行；请只使用可丢弃测试库。当前没有覆盖完整真实模型 E2E、全部领域集成和所有故障注入场景的测试套件。
+测试覆盖 Goal/Task 状态转换、Evidence 门控、A0–A3 Policy、审批哈希和过期、Tool Registry/Gateway、Native filesystem/SSRF 边界、模型 Tool Call 往返/Approval Checkpoint 精确续行/输出不写入 checkpoint、预算校验、配置校验、计划 DAG、Provider/Tool-call Schema、Knowledge 分块等。MCP 测试使用官方 SDK Client + 真实 Streamable HTTP Server 和真实 stdio 子进程 Server，覆盖发现、Schema 变更、审批、重放、错误、超时、主动取消、进程崩溃及自动恢复。PostgreSQL 集成测试覆盖 MCP Gateway 审批、Invocation/Audit/Outbox、恢复以及 Goal Tool Call 累计预算账本。
 
-已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...`、Compose/YAML 配置解析，以及 Phase 9/10 的 PostgreSQL 16/pgvector 真实迁移、集成、Worker fencing/checkpoint 和服务重启恢复验收。Phase 10 的 Mock Agent 仍输出未经独立验证的结果，因此 Worker 不会伪称真实任务已完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)、[docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)、[docs/PHASE10_IMPLEMENTATION_REPORT.md](docs/PHASE10_IMPLEMENTATION_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
+已验证 `make fmt`, `make test`, `make build`, `make vet`, `go test -race ./...` 和 fresh isolated PostgreSQL 16/pgvector 的 `make test-integration`。Phase 11 MCP 已使用真实官方 SDK Client/Server 验证本地 Streamable HTTP；MCP 工具通过 Gateway Policy/Approval，并在真实 PostgreSQL 中完成 Invocation、Audit/Outbox 与结果重放验收。Phase 10 的 Mock Agent 仍输出未经独立验证的结果，因此 Worker 不会伪称真实任务已完成。请参阅 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)、[docs/DATABASE_INTEGRATION_REPORT.md](docs/DATABASE_INTEGRATION_REPORT.md)、[docs/PHASE10_IMPLEMENTATION_REPORT.md](docs/PHASE10_IMPLEMENTATION_REPORT.md)、[docs/PHASE11_DESIGN.md](docs/PHASE11_DESIGN.md)、[docs/PHASE11_IMPLEMENTATION_REPORT.md](docs/PHASE11_IMPLEMENTATION_REPORT.md)、[docs/PHASE11_MCP_DESIGN.md](docs/PHASE11_MCP_DESIGN.md)、[docs/PHASE11_MCP_IMPLEMENTATION_REPORT.md](docs/PHASE11_MCP_IMPLEMENTATION_REPORT.md) 和 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)。较早的 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) 是 Phase 0 基线记录，不等于当前完成状态。
 
-主要尚未实现或不完整的能力：Eino、生产级内置工具/MCP 与审批执行器连接、真实 Agent 的独立结果验证、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API。Phase 10 的持久 Claim/Lease/fencing、Checkpoint、Step 幂等和 Worker 恢复已实现并通过真实 PostgreSQL 故障恢复验收；这不代表任意外部副作用 exactly-once。
+主要尚未实现或不完整的能力：Supervisor 基于 Evidence 的动态进度评估/重规划、独立 Agent 结果验证、多 Agent 协作、MCP OAuth/HTTP 凭据、安全凭据仓储、Memory/Knowledge Embedding 与向量检索、RBAC/API Token、文件存储、Outbox 发布 worker、Audit 查询/保留策略、OpenTelemetry、Node 心跳 API。ModelAgent 已可围绕单个 Task 进行有界 Tool Call 往返和审批 checkpoint 恢复，但最终回答仍为未验证，不能完成 Task/Goal。MCP Server 配置来自受控的 `MCP_SERVERS_JSON`，不允许 API 或 Agent 任意注册命令。Filesystem 路径防护使用配置根目录与符号链接解析；根目录应由可信管理员维护，避免其他本地进程并发改写目录结构。Tool 外部副作用结果未知时不会自动重放；这不代表任意外部 API exactly-once。
 
 ## 依赖边界与变更原则 | Contribution boundaries
 

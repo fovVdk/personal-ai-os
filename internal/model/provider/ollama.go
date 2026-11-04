@@ -22,11 +22,28 @@ type Ollama struct {
 	HTTPClient *http.Client
 }
 type ollamaRequest struct {
-	Model    string            `json:"model"`
-	Messages []gateway.Message `json:"messages"`
-	Tools    []map[string]any  `json:"tools,omitempty"`
-	Stream   bool              `json:"stream"`
-	Options  map[string]any    `json:"options,omitempty"`
+	Model    string           `json:"model"`
+	Messages []ollamaMessage  `json:"messages"`
+	Tools    []map[string]any `json:"tools,omitempty"`
+	Stream   bool             `json:"stream"`
+	Options  map[string]any   `json:"options,omitempty"`
+}
+
+type ollamaMessage struct {
+	Role       string           `json:"role"`
+	Content    string           `json:"content"`
+	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolName   string           `json:"tool_name,omitempty"`
+}
+
+type ollamaToolCall struct {
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
 }
 type ollamaResponse struct {
 	Model   string `json:"model"`
@@ -88,7 +105,18 @@ func (p Ollama) Complete(ctx context.Context, request gateway.Request) (gateway.
 		}
 		tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": definition.Name, "description": definition.Description, "parameters": schema}})
 	}
-	payload, err := json.Marshal(ollamaRequest{Model: request.Model, Messages: request.Messages, Tools: tools, Stream: false, Options: options})
+	messages := make([]ollamaMessage, 0, len(request.Messages))
+	for _, message := range request.Messages {
+		converted := ollamaMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID, ToolName: message.ToolName}
+		for _, call := range message.ToolCalls {
+			converted.ToolCalls = append(converted.ToolCalls, ollamaToolCall{ID: call.ID, Type: "function", Function: struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}{Name: call.Name, Arguments: append(json.RawMessage(nil), call.Arguments...)}})
+		}
+		messages = append(messages, converted)
+	}
+	payload, err := json.Marshal(ollamaRequest{Model: request.Model, Messages: messages, Tools: tools, Stream: false, Options: options})
 	if err != nil {
 		return gateway.Response{}, fmt.Errorf("encode Ollama request: %w", err)
 	}

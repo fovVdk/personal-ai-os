@@ -8,15 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"personal-ai-os/internal/agent/registry"
 	agentruntime "personal-ai-os/internal/agent/runtime"
 	"personal-ai-os/internal/execution"
 	"personal-ai-os/internal/supervisor"
+	toolgateway "personal-ai-os/internal/tool/gateway"
+	toolregistry "personal-ai-os/internal/tool/registry"
 )
 
-type durableAgentExecutor struct{ agents *registry.Registry }
+type durableAgentExecutor struct {
+	agents *registry.Registry
+	tools  *toolgateway.Gateway
+}
 
 func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, checkpoint *execution.Checkpoint, progress execution.Progress) (execution.ExecutionResult, error) {
 	if e.agents == nil {
@@ -28,6 +34,8 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 	}
 	request.TaskID = run.TaskID
 	request.GoalID = run.GoalID
+	toolCaller := &durableToolCaller{gateway: e.tools, run: run, progress: progress, maxCalls: request.MaxToolCalls}
+	request.Tools = toolCaller
 	if checkpoint != nil {
 		request.ResumeCheckpoint = append(json.RawMessage(nil), checkpoint.Progress...)
 		request.CompletedSteps = append([]string(nil), checkpoint.CompletedSteps...)
@@ -56,6 +64,10 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 	if err != nil {
 		return execution.ExecutionResult{}, err
 	}
+	// Enforce the budget using Core-observed calls, not the Agent-reported counter.
+	if observedCalls := int(toolCaller.calls.Load()); observedCalls > result.ToolCalls {
+		result.ToolCalls = observedCalls
+	}
 	if result.Outcome != agentruntime.OutcomeSucceeded || !result.Verified || result.Steps < 1 || result.Steps > request.MaxSteps || len(result.Evidence) == 0 {
 		return execution.ExecutionResult{}, execution.Failure{Class: execution.FailurePermanent, Err: supervisor.ErrUnverifiedResult}
 	}
@@ -74,12 +86,51 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 	}
 	output := supervisor.Execution{ID: run.ID, TaskID: run.TaskID, AgentID: profile.ID, Summary: result.Summary, Outcome: result.Outcome,
 		InputTokens: result.InputTokens, OutputTokens: result.OutputTokens, TotalTokens: result.ModelTokens, ModelCalls: result.ModelCalls,
-		Evidence: supervisorEvidence, CompletedAt: completedAt, Verified: result.Verified}
+		ToolCalls: result.ToolCalls, Evidence: supervisorEvidence, CompletedAt: completedAt, Verified: result.Verified}
 	encoded, err := json.Marshal(output)
 	if err != nil {
 		return execution.ExecutionResult{}, fmt.Errorf("encode durable Agent result: %w", err)
 	}
 	return execution.ExecutionResult{Result: encoded, Evidence: evidence, VerifiedResult: result.Verified}, nil
+}
+
+type durableToolCaller struct {
+	gateway  *toolgateway.Gateway
+	run      execution.Run
+	progress execution.Progress
+	maxCalls int
+	calls    atomic.Int32
+}
+
+func (c *durableToolCaller) ExecuteTool(ctx context.Context, call agentruntime.ToolCallRequest) (agentruntime.ToolCallResult, error) {
+	if c.gateway == nil {
+		return agentruntime.ToolCallResult{}, errors.New("Tool Gateway is not configured")
+	}
+	if c.maxCalls < 1 || int(c.calls.Add(1)) > c.maxCalls {
+		return agentruntime.ToolCallResult{}, agentruntime.ErrBudgetExceeded
+	}
+	if call.StepID == "" || len(call.StepID) > 128 || call.IdempotencyKey == "" || len(call.IdempotencyKey) > 256 {
+		return agentruntime.ToolCallResult{}, errors.New("Tool Call requires a bounded Step ID and idempotency key")
+	}
+	if c.progress == nil {
+		return agentruntime.ToolCallResult{}, errors.New("durable execution step store is unavailable")
+	}
+	identity := toolregistry.Identity{ProviderID: call.ProviderID, ToolID: call.ToolID, Version: call.Version}
+	lease := execution.Lease{ExecutionID: c.run.ID, WorkerID: c.run.WorkerID, Fencing: c.run.FencingToken, LeaseUntil: c.run.LeaseUntil}
+	if _, err := c.progress.ClaimStep(ctx, call.StepID, call.IdempotencyKey, toolgateway.RequestHash(identity, call.Arguments)); err != nil {
+		return agentruntime.ToolCallResult{}, fmt.Errorf("claim durable Tool step: %w", err)
+	}
+	result, err := c.gateway.Execute(ctx, toolgateway.Request{
+		GoalID: c.run.GoalID, TaskID: c.run.TaskID, ExecutionID: c.run.ID, StepID: call.StepID, AgentID: c.run.AgentID,
+		Identity:       identity,
+		IdempotencyKey: call.IdempotencyKey, ApprovalID: call.ApprovalID,
+		Lease:     lease,
+		Arguments: call.Arguments,
+	})
+	if err == nil && result.Status == "waiting_approval" {
+		err = execution.Failure{Class: execution.FailureApprovalNeeded, Err: toolgateway.ErrApprovalRequired}
+	}
+	return agentruntime.ToolCallResult{InvocationID: result.InvocationID, Status: result.Status, ApprovalID: result.ApprovalID, Result: result.Result, Replayed: result.Replayed}, err
 }
 
 func convertCheckpoint(checkpoint *execution.Checkpoint) *agentruntime.Checkpoint {

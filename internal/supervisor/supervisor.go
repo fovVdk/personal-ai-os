@@ -42,6 +42,7 @@ type Execution struct {
 	OutputTokens int                  `json:"output_tokens"`
 	TotalTokens  int                  `json:"total_tokens"`
 	ModelCalls   int                  `json:"model_calls"`
+	ToolCalls    int                  `json:"tool_calls"`
 	Evidence     []Evidence           `json:"evidence"`
 	CompletedAt  time.Time            `json:"completed_at"`
 	Verified     bool                 `json:"verified"`
@@ -54,12 +55,13 @@ type ExecutionStore interface {
 
 type UsageStore interface {
 	ModelUsage(context.Context, string) (UsageTotals, error)
-	RecordModelUsage(context.Context, string, int, int, int) error
+	RecordModelUsage(context.Context, string, int, int, int, int) error
 }
 
 type UsageTotals struct {
 	ModelCalls  int
 	ModelTokens int
+	ToolCalls   int
 }
 
 type StatusStore interface {
@@ -140,6 +142,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		for _, execution := range savedExecutions {
 			usedUsage.ModelTokens += execution.TotalTokens
 			usedUsage.ModelCalls += execution.ModelCalls
+			usedUsage.ToolCalls += execution.ToolCalls
 		}
 	}
 	for _, execution := range savedExecutions {
@@ -221,7 +224,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 			return TurnResult{}, errors.New("planner exceeded model call/token budget")
 		}
 		if s.Usage != nil && (plannerModelCalls > 0 || plannerModelTokens > 0) {
-			if err := s.Usage.RecordModelUsage(runCtx, goalItem.ID, plannerModelCalls, plan.ModelInputTokens, plan.ModelOutputTokens); err != nil {
+			if err := s.Usage.RecordModelUsage(runCtx, goalItem.ID, plannerModelCalls, 0, plan.ModelInputTokens, plan.ModelOutputTokens); err != nil {
 				return TurnResult{}, fmt.Errorf("persist planner token usage: %w", err)
 			}
 		}
@@ -249,6 +252,9 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 	results := make([]Execution, 0)
 	var observedCost float64
 	observedModelCalls, observedToolCalls, observedTokens := plannerModelCalls, 0, plannerModelTokens
+	if usedUsage.ToolCalls > budgets.MaxToolCalls {
+		return TurnResult{}, errors.New("supervisor persisted Tool Call budget is already exhausted")
+	}
 	for step := 0; step < budgets.MaxSteps; step++ {
 		if err := runCtx.Err(); err != nil {
 			return TurnResult{}, err
@@ -332,7 +338,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		if remainingCalls < 0 {
 			return TurnResult{}, errors.New("supervisor model call budget exceeded")
 		}
-		agentRequest := agentruntime.Request{TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline}
+		agentRequest := agentruntime.Request{TaskID: selected.ID, GoalID: goalItem.ID, Title: selected.Title, Description: selected.Description, SuccessCriteria: selected.SuccessCriteria, MaxSteps: budgets.MaxSteps - step, MaxModelCalls: remainingCalls, MaxToolCalls: budgets.MaxToolCalls - usedUsage.ToolCalls - observedToolCalls, MaxTokens: remainingTokens, MaxCost: remainingCost, Deadline: deadline}
 		if s.Runtime != nil {
 			declaration, hasIdempotencyGuarantee := profile.Agent.(agentruntime.IdempotencyDeclaration)
 			idempotent := hasIdempotencyGuarantee && declaration.IdempotencyGuarantee()
@@ -360,6 +366,10 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 			}
 			observedModelCalls += durableResult.ModelCalls
 			observedTokens += durableResult.TotalTokens
+			observedToolCalls += durableResult.ToolCalls
+			if usedUsage.ToolCalls+observedToolCalls > budgets.MaxToolCalls {
+				return TurnResult{}, errors.New("durable Agent result exceeded Goal Tool Call budget")
+			}
 			completed[selected.ID] = struct{}{}
 			results = append(results, durableResult)
 			continue
@@ -383,7 +393,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 			}
 			return TurnResult{}, ErrUnverifiedResult
 		}
-		if agentResult.ModelCalls < 0 || agentResult.ToolCalls < 0 || observedModelCalls+agentResult.ModelCalls > remainingCalls || observedToolCalls+agentResult.ToolCalls > budgets.MaxToolCalls {
+		if agentResult.ModelCalls < 0 || agentResult.ToolCalls < 0 || observedModelCalls+agentResult.ModelCalls > remainingCalls || usedUsage.ToolCalls+observedToolCalls+agentResult.ToolCalls > budgets.MaxToolCalls {
 			failedCtx, cancelFailure := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			_, transitionErr := s.Tasks.Transition(failedCtx, selected.ID, task.Failed)
 			cancelFailure()
@@ -422,7 +432,7 @@ func (s *Supervisor) Turn(ctx context.Context, request TurnRequest) (TurnResult,
 		for _, item := range agentResult.Evidence {
 			evidence = append(evidence, Evidence{TaskID: selected.ID, Source: item.Source, Description: item.Description, Reference: item.Reference, ObservedAt: completedAt})
 		}
-		execution, err := s.Executions.Save(runCtx, Execution{TaskID: selected.ID, AgentID: profile.ID, Summary: agentResult.Summary, Outcome: agentResult.Outcome, InputTokens: agentResult.InputTokens, OutputTokens: agentResult.OutputTokens, TotalTokens: agentResult.ModelTokens, ModelCalls: agentResult.ModelCalls, Evidence: evidence, CompletedAt: completedAt})
+		execution, err := s.Executions.Save(runCtx, Execution{TaskID: selected.ID, AgentID: profile.ID, Summary: agentResult.Summary, Outcome: agentResult.Outcome, InputTokens: agentResult.InputTokens, OutputTokens: agentResult.OutputTokens, TotalTokens: agentResult.ModelTokens, ModelCalls: agentResult.ModelCalls, ToolCalls: agentResult.ToolCalls, Evidence: evidence, CompletedAt: completedAt})
 		if err != nil {
 			return TurnResult{}, fmt.Errorf("persist execution evidence: %w", err)
 		}
