@@ -36,6 +36,7 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 	}
 	request.TaskID = run.TaskID
 	request.GoalID = run.GoalID
+	request.ExecutionID = run.ID
 	toolCaller := &durableToolCaller{gateway: e.tools, run: run, progress: progress, maxCalls: request.MaxToolCalls}
 	request.Tools = toolCaller
 	if checkpoint != nil {
@@ -67,6 +68,7 @@ func (e durableAgentExecutor) Execute(ctx context.Context, run execution.Run, ch
 		return execution.ExecutionResult{}, err
 	}
 	// Enforce the budget using Core-observed calls, not the Agent-reported counter.
+	// 中文：预算以 Core 实际观察到的调用次数为准，而不是 Agent 自报的计数。
 	if observedCalls := int(toolCaller.calls.Load()); observedCalls > result.ToolCalls {
 		result.ToolCalls = observedCalls
 	}

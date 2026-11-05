@@ -17,6 +17,7 @@ import (
 )
 
 // Source identifies who supplied a Tool definition; it never grants execution permission.
+// 中文：Source 标识 Tool 定义的提供方，但不授予执行权限。
 type Source string
 
 const (
@@ -26,6 +27,7 @@ const (
 )
 
 // Kind classifies a Tool's effect boundary.
+// 中文：Kind 用于划分 Tool 的副作用边界。
 type Kind string
 
 const (
@@ -36,6 +38,7 @@ const (
 )
 
 // Idempotency describes the provider's externally-enforced replay contract.
+// 中文：Idempotency 描述提供方强制执行的重放契约。
 type Idempotency string
 
 const (
@@ -53,6 +56,7 @@ const (
 )
 
 // Identity uniquely names a published version. Tool IDs are provider-qualified.
+// 中文：Identity 唯一标识一个发布版本；Tool ID 必须带 Provider 命名空间。
 type Identity struct {
 	ProviderID string `json:"provider_id"`
 	ToolID     string `json:"tool_id"`
@@ -60,6 +64,7 @@ type Identity struct {
 }
 
 // Definition is immutable after registration; mutable operational state lives in Entry.
+// 中文：注册后 Definition 不可变；可变的运行状态保存在 Entry 中。
 type Definition struct {
 	Identity             Identity        `json:"identity"`
 	Name                 string          `json:"name"`
@@ -88,6 +93,7 @@ type Handler interface {
 
 // InvocationContext contains request identity copied by the Tool Gateway after validation.
 // Tool arguments cannot override these fields.
+// 中文：InvocationContext 保存 Gateway 校验后复制的请求身份；Tool 参数不能覆盖这些字段。
 type InvocationContext struct {
 	GoalID      string
 	TaskID      string
@@ -97,6 +103,7 @@ type InvocationContext struct {
 }
 
 // ContextualHandler is optional for Tools that must bind durable records to the verified invocation.
+// 中文：需要将持久化记录绑定到已验证调用的 Tool 可实现 ContextualHandler。
 type ContextualHandler interface {
 	ExecuteWithContext(context.Context, InvocationContext, json.RawMessage) (json.RawMessage, error)
 }
@@ -198,6 +205,7 @@ func (r *Registry) List() []Entry {
 }
 
 // SetOperationalState changes only operator-controlled enablement and health, never metadata.
+// 中文：SetOperationalState 只修改运维控制的启用状态和健康状态，不修改 Tool 元数据。
 func (r *Registry) SetOperationalState(identity Identity, enabled bool, health Health) error {
 	if health != HealthUnknown && health != HealthHealthy && health != HealthUnhealthy {
 		return errors.New("invalid tool health state")
@@ -281,6 +289,7 @@ func validateDefinition(definition *Definition) error {
 }
 
 // validateSchema accepts the intentionally narrow JSON Schema subset supported by the Tool boundary.
+// 中文：validateSchema 仅接受 Tool 边界明确支持的受限 JSON Schema 子集。
 func validateSchema(raw json.RawMessage) error {
 	if len(raw) == 0 || len(raw) > 256<<10 {
 		return errors.New("schema must be present and no larger than 256 KiB")
@@ -338,6 +347,7 @@ func validateSchema(raw json.RawMessage) error {
 }
 
 // Validate checks a JSON object against the exact registered root and primitive property types.
+// 中文：Validate 按注册的根对象和基础属性类型严格校验 JSON 输入。
 func Validate(schemaRaw, valueRaw json.RawMessage) error {
 	if err := validateSchema(schemaRaw); err != nil {
 		return fmt.Errorf("registered schema invalid: %w", err)

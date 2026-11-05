@@ -19,6 +19,7 @@ type Request struct {
 	OwnerID            string
 	TaskID             string
 	GoalID             string
+	ExecutionID        string
 	Title              string
 	Description        string
 	SuccessCriteria    []string

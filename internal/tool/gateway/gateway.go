@@ -53,11 +53,13 @@ type Authorization struct {
 
 type Authorizer interface {
 	// Authorize must resolve grants/autonomy from trusted persisted policy, not Request fields.
+	// 中文：Authorize 必须从可信持久化策略解析授权和自主等级，不能信任 Request 字段。
 	Authorize(context.Context, Request, registry.Definition) (Authorization, error)
 }
 
 type LeaseVerifier interface {
 	// Verify must check execution/task association, worker, fencing token, active lease and cancellation.
+	// 中文：Verify 必须检查 Execution/Task 关联、Worker、Fencing Token、活动租约及取消状态。
 	Verify(context.Context, Request) error
 }
 
@@ -73,8 +75,10 @@ type Reservation struct {
 
 type InvocationStore interface {
 	// RequestApproval persists a pending invocation and exact context-bound approval without dispatch.
+	// 中文：RequestApproval 持久化待审批 Invocation 和精确上下文审批，但不派发工具。
 	RequestApproval(context.Context, Request, registry.Definition, string) (InvocationResult, error)
 	// Begin atomically reserves the unique invocation and consumes a matching one-time approval if supplied.
+	// 中文：Begin 原子预留唯一 Invocation；若提供匹配的一次性审批，则在同一边界消费。
 	Begin(context.Context, Request, registry.Definition, string) (Reservation, error)
 	Complete(context.Context, Reservation, json.RawMessage) error
 	Fail(context.Context, Reservation, string, string) error
@@ -178,6 +182,7 @@ func (g *Gateway) Execute(ctx context.Context, request Request) (InvocationResul
 	}
 	if callErr != nil {
 		// A handler error does not prove that an external side effect did not happen.
+		// 中文：Handler 返回错误不代表外部副作用一定未发生。
 		if err := g.markUnknown(reservation, "tool handler returned an error; external outcome is uncertain"); err != nil {
 			return InvocationResult{InvocationID: reservation.InvocationID, Status: "unknown"}, fmt.Errorf("tool failed (%v) and unknown outcome persistence failed: %w", callErr, err)
 		}
@@ -211,6 +216,7 @@ func (g *Gateway) Execute(ctx context.Context, request Request) (InvocationResul
 }
 
 // RequestHash returns the canonical, version-bound idempotency hash used by both Step and Tool Invocation stores.
+// 中文：RequestHash 生成规范化且绑定工具版本的幂等哈希，供 Step 和 Tool Invocation 存储共用。
 func RequestHash(identity registry.Identity, arguments json.RawMessage) string {
 	canonical, err := canonicalize(arguments)
 	if err != nil {

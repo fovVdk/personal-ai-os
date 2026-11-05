@@ -86,6 +86,11 @@ func run() error {
 		return fmt.Errorf("create configured file storage root: %w", err)
 	}
 	fileRoot := cfg.FileStorageDir
+	if cfg.ReportExportDir != "" {
+		if err := os.MkdirAll(cfg.ReportExportDir, 0o700); err != nil {
+			return fmt.Errorf("create configured report export root: %w", err)
+		}
+	}
 	var artifactVerifier agentruntime.ResultVerifier
 	configuredVerifier, err := verification.NewArtifactVerifier(fileRoot, 8<<20)
 	if err != nil {
@@ -94,7 +99,7 @@ func run() error {
 	configuredVerifier.Sources = repositories.Sources()
 	artifactVerifier = configuredVerifier
 	repositories.SetArtifactFreshnessVerifier(configuredVerifier)
-	if err := builtin.Register(tools, builtin.Options{FileRoot: fileRoot, OwnerID: store.LocalOwnerID, Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Sources: repositories.Sources(), HTTPFetchAllowedHosts: cfg.HTTPFetchAllowedHosts}); err != nil {
+	if err := builtin.Register(tools, builtin.Options{FileRoot: fileRoot, ReportExportRoot: cfg.ReportExportDir, OwnerID: store.LocalOwnerID, Goals: repositories, Tasks: repositories.Tasks(), Memories: repositories.Memories(), Knowledge: repositories.Knowledge(), Sources: repositories.Sources(), HTTPFetchAllowedHosts: cfg.HTTPFetchAllowedHosts}); err != nil {
 		return fmt.Errorf("register built-in tools: %w", err)
 	}
 	mcpManager, err := toolmcp.NewManager(tools, toolmcp.Options{})
@@ -106,14 +111,18 @@ func run() error {
 	}
 	defer mcpManager.Close()
 	toolGrants := make(toolgateway.StaticGrants)
-	for _, toolID := range []string{"time.now", "filesystem.read", "filesystem.list", "memory.search", "knowledge.search", "http.fetch", "source.capture"} {
+	for _, toolID := range []string{"time.now", "filesystem.read", "filesystem.list", "artifact.write", "report.export", "memory.search", "knowledge.search", "http.fetch", "source.capture", "source.reference.add"} {
 		identity := toolregistry.Identity{ProviderID: "paios.native", ToolID: toolID, Version: "v1"}
 		if _, err := tools.Get(identity); err == nil {
 			autonomy := policy.A0
-			if toolID == "source.capture" {
+			if toolID == "source.capture" || toolID == "source.reference.add" || toolID == "artifact.write" {
 				autonomy = policy.A1
 			}
-			toolGrants[identity.ProviderID+"/"+identity.ToolID+"@"+identity.Version] = toolgateway.Grant{Allowed: true, Autonomy: autonomy}
+			grant := toolgateway.Grant{Allowed: true, Autonomy: autonomy}
+			if toolID == "report.export" {
+				grant.Autonomy, grant.ApprovalRequired = policy.A2, true
+			}
+			toolGrants[identity.ProviderID+"/"+identity.ToolID+"@"+identity.Version] = grant
 		}
 	}
 	toolGateway := &toolgateway.Gateway{Registry: tools, Authorizer: toolgateway.PolicyAuthorizer{Grants: configuredToolGrants{native: toolGrants, mcp: mcpManager}}, Leases: repositories, Store: repositories}

@@ -561,6 +561,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// A failed dependency insertion must roll back every task inserted earlier in the same plan transaction.
+	// 中文：依赖关系插入失败时，必须回滚同一计划事务中此前已写入的所有 Task。
 	beforeTasks := countForGoal(t, ctx, pool, "tasks", "goal_id", createdGoal.ID)
 	_, err = repository.CreateTasks(ctx, []task.Task{
 		{GoalID: createdGoal.ID, PlanKey: "valid", Title: uniqueLabel("rollback-task"), Priority: 3, Status: task.Created},
@@ -574,6 +575,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// The task row and its goal relationship are protected by a real PostgreSQL FK.
+	// 中文：真实 PostgreSQL 外键保证 Task 行及其 Goal 关系有效。
 	_, err = tasks.Create(ctx, task.Task{GoalID: "ffffffff-ffff-4fff-8fff-ffffffffffff", Title: uniqueLabel("orphan-task"), Priority: 3, Status: task.Created})
 	assertPostgresCode(t, err, "23503", "task-to-goal foreign key")
 
@@ -611,6 +613,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// A database error after execution/evidence/outbox inserts must roll the entire execution transaction back.
+	// 中文：Execution、Evidence 或 Outbox 插入后发生数据库错误时，整个执行事务必须回滚。
 	rollbackTask, err := tasks.Create(ctx, task.Task{GoalID: createdGoal.ID, Title: uniqueLabel("execution-rollback-task"), Priority: 2, Status: task.Created})
 	if err != nil {
 		t.Fatalf("create rollback task: %v", err)
@@ -659,6 +662,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// A failed audit insert must roll back the Goal, its outbox event, and its audit row together.
+	// 中文：Audit 插入失败时，Goal、对应 Outbox 事件和审计记录必须作为一个事务共同回滚。
 	rollbackTitle := uniqueLabel("goal-transaction-rollback")
 	withAuditFailure(t, ctx, pool, "goal.created", func() {
 		_, err := repository.Create(ctx, goal.Goal{OwnerID: testOwnerID, Title: rollbackTitle, Priority: 3, Status: goal.Draft})
@@ -671,6 +675,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	assertZero(t, ctx, pool, "SELECT count(*) FROM audit_records WHERE action='goal.created' AND metadata->>'title'=$1", rollbackTitle)
 
 	// Persist a Goal approval, verify A3 gating, then race two decisions against the same locked row.
+	// 中文：持久化 Goal 审批并验证 A3 门控，然后让两个审批决策竞争同一行锁。
 	approvalItem, err := approval.New(testOwnerID, createdTask.ID, "integration-tool", "test-action", map[string]any{"value": "exact"}, 3, time.Now().Add(time.Hour), time.Now())
 	if err != nil {
 		t.Fatalf("create approval request value: %v", err)
@@ -771,6 +776,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// Exercise Memory CRUD/full-text search/soft delete against PostgreSQL.
+	// 中文：使用 PostgreSQL 验证 Memory CRUD、全文检索和软删除。
 	memories := repository.Memories()
 	createdMemory, err := memories.Create(ctx, memory.Memory{OwnerID: testOwnerID, Category: memory.Fact, Content: uniqueLabel("cobalt-memory-search"), Source: "integration-test", Confidence: 0.9, Metadata: map[string]any{"origin": "test"}})
 	if err != nil {
@@ -797,6 +803,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	assertPostgresCode(t, err, "23514", "memory category check")
 
 	// Knowledge import, deduplication, chunk persistence, and cited full-text retrieval.
+	// 中文：验证 Knowledge 导入、去重、分块持久化及带引用的全文检索。
 	knowledgeRepository := repository.Knowledge()
 	content := "PostgreSQL knowledge retrieval marker cobalt systems"
 	document := knowledge.Document{OwnerID: testOwnerID, Title: uniqueLabel("knowledge-title"), Source: "integration-test", ContentHash: knowledge.HashContent(content), Chunks: []knowledge.Chunk{{Index: 0, Content: content, Metadata: map[string]any{"part": 1}}}, Metadata: map[string]any{"kind": "test"}}
@@ -814,6 +821,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// Node registration is durable, duplicate identity intentionally upserts, and heartbeat changes status.
+	// 中文：Node 注册具有持久性；重复身份按设计执行 upsert，心跳会更新节点状态。
 	nodes := repository.Nodes()
 	nodeIdentity := uniqueLabel("node-identity")
 	createdNode, err := nodes.Register(ctx, node.Node{Identity: nodeIdentity, Name: "Integration Worker", Type: node.Worker, Capabilities: []string{"db-test"}})
@@ -833,6 +841,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	verifyDurableClaimCheckpointFencing(t, ctx, pool, repository, createdGoal.ID, &taskIDs)
 
 	// Goal completion requires a fresh persisted Evaluation whose typed criterion is supported by verified execution evidence.
+	// 中文：Goal 完成要求新鲜且已持久化的 Evaluation，类型化标准必须由已验证执行证据支持。
 	completionGoal, err := repository.Create(ctx, goal.Goal{
 		OwnerID: testOwnerID, Title: uniqueLabel("completion-gate-goal"), Priority: 3, Status: goal.Active,
 		Criteria: []goal.SuccessCriterion{{
@@ -896,6 +905,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 		t.Fatalf("evaluate after cancelling unrelated Task=%+v tasks=%+v err=%v", completionEvaluation, goalTasks, err)
 	}
 	// Goal evidence and status transition commit atomically; retrieval includes persisted evidence.
+	// 中文：Goal Evidence 与状态转换必须原子提交，读取时返回已持久化证据。
 	completedGoal, err := repository.Transition(ctx, testOwnerID, completionGoal.ID, goal.Completed, []goal.Evidence{{Source: "caller-claim", Description: "this untrusted request evidence must be ignored", Reference: "model://claim", ObservedAt: time.Now().UTC()}})
 	if err != nil || completedGoal.Progress != 100 || len(completedGoal.Evidence) != 1 {
 		t.Fatalf("complete Goal=%+v err=%v", completedGoal, err)
@@ -913,6 +923,7 @@ func TestPostgresCorePersistenceConstraintsAndTransactions(t *testing.T) {
 	}
 
 	// Verify committed Goal/Task/Execution mutations have matching audit and outbox records.
+	// 中文：核对已提交的 Goal/Task/Execution 修改均有对应 Audit 和 Outbox 记录。
 	for _, id := range []string{createdGoal.ID, createdTask.ID, savedExecution.ID, completionGoal.ID, completionTask.ID, completionRun.ID} {
 		var outboxCount, auditCount int
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE aggregate_id=$1", id).Scan(&outboxCount); err != nil {
@@ -1583,6 +1594,10 @@ func cleanupIntegrationRows(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM audit_records WHERE resource='tool_invocations' AND resource_id IN (SELECT id::text FROM tool_invocations WHERE task_id::text=ANY($1::text[]))`, taskIDs); err != nil {
 			t.Errorf("clean integration Tool invocation audit fixtures: %v", err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM goal_job_wake_events WHERE event_id IN (SELECT id FROM event_outbox WHERE aggregate_type='tool_invocations' AND aggregate_id IN (SELECT id FROM tool_invocations WHERE task_id::text=ANY($1::text[])))`, taskIDs); err != nil {
+			t.Errorf("clean integration Tool invocation wake receipts: %v", err)
 			return
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM event_outbox WHERE aggregate_type='tool_invocations' AND aggregate_id IN (SELECT id FROM tool_invocations WHERE task_id::text=ANY($1::text[]))`, taskIDs); err != nil {

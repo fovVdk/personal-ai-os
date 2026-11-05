@@ -1,3 +1,5 @@
+// English: This PostgreSQL fault-injection test verifies Outbox retry, dead-letter, and audit behavior.
+// 中文：本 PostgreSQL 故障注入测试验证 Outbox 重试、死信及审计行为。
 package integration
 
 import (

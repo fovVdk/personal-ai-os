@@ -410,6 +410,7 @@ func verifyCriterion(goalID string, criterion goal.SuccessCriterion, tasks []tas
 				if run.VerificationMethod != "core.file-artifact/v1" {
 					continue
 				}
+				artifactEvidenceMatched := false
 				for _, evidence := range run.Evidence {
 					if evidence.CriterionID != criterion.ID || evidence.CriterionVersion != criterion.Version || evidence.VerifierType != "core.file-artifact" || evidence.VerifierVersion != "v1" || len(evidence.ContentHash) != 64 {
 						continue
@@ -418,9 +419,26 @@ func verifyCriterion(goalID string, criterion goal.SuccessCriterion, tasks []tas
 					if !strings.HasPrefix(evidence.Reference, prefix) || !strings.HasSuffix(evidence.Reference, evidence.ContentHash) {
 						continue
 					}
-					matched++
+					artifactEvidenceMatched = true
 					appendReferences(run, evidence)
 				}
+				if !artifactEvidenceMatched {
+					continue
+				}
+				if criterion.RequireReference {
+					referenceCount := 0
+					for _, evidence := range run.Evidence {
+						if evidence.CriterionID != criterion.ID || evidence.CriterionVersion != criterion.Version || evidence.VerifierType != "core.source-reference" || evidence.VerifierVersion != "v1" || len(evidence.ContentHash) != 64 || !strings.HasPrefix(evidence.Reference, "source://") || !strings.HasSuffix(evidence.Reference, "#sha256="+evidence.ContentHash) {
+							continue
+						}
+						referenceCount++
+						appendReferences(run, evidence)
+					}
+					if referenceCount == 0 {
+						continue
+					}
+				}
+				matched++
 			}
 		}
 		if matched > 0 {

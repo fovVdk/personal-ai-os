@@ -18,6 +18,7 @@ import (
 
 type DurableRuntime interface {
 	Enqueue(context.Context, execution.EnqueueRequest) (execution.Run, bool, error)
+	ActiveForTask(context.Context, string) (execution.Run, bool, error)
 	Get(context.Context, string) (execution.Run, error)
 	VerifiedTaskIDs(context.Context, string) ([]string, error)
 }
@@ -26,20 +27,26 @@ func (s *Supervisor) executeDurably(ctx context.Context, item task.Task, agentID
 	if s.Runtime == nil {
 		return Execution{}, execution.Run{}, errors.New("durable execution runtime is not configured")
 	}
-	persistedRequest := request
-	persistedRequest.Deadline = time.Time{}
-	payload, err := json.Marshal(persistedRequest)
+	run, active, err := s.Runtime.ActiveForTask(ctx, item.ID)
 	if err != nil {
-		return Execution{}, execution.Run{}, fmt.Errorf("encode durable agent request: %w", err)
+		return Execution{}, execution.Run{}, fmt.Errorf("load active durable execution for Task: %w", err)
 	}
-	hash := sha256.Sum256(payload)
-	key := fmt.Sprintf("attempt-%d", item.AttemptCount)
-	run, _, err := s.Runtime.Enqueue(ctx, execution.EnqueueRequest{
-		TaskID: item.ID, AgentID: agentID, IdempotencyScope: item.ID, IdempotencyKey: key,
-		InputHash: hex.EncodeToString(hash[:]), Payload: payload, MaxAttempts: max(1, s.Budgets.MaxRetries+1), RetrySafe: retrySafe, Idempotent: idempotent,
-	})
-	if err != nil {
-		return Execution{}, execution.Run{}, fmt.Errorf("enqueue durable task execution: %w", err)
+	if !active {
+		persistedRequest := request
+		persistedRequest.Deadline = time.Time{}
+		payload, err := json.Marshal(persistedRequest)
+		if err != nil {
+			return Execution{}, execution.Run{}, fmt.Errorf("encode durable agent request: %w", err)
+		}
+		hash := sha256.Sum256(payload)
+		key := fmt.Sprintf("attempt-%d", item.AttemptCount)
+		run, _, err = s.Runtime.Enqueue(ctx, execution.EnqueueRequest{
+			TaskID: item.ID, AgentID: agentID, IdempotencyScope: item.ID, IdempotencyKey: key,
+			InputHash: hex.EncodeToString(hash[:]), Payload: payload, MaxAttempts: max(1, s.Budgets.MaxRetries+1), RetrySafe: retrySafe, Idempotent: idempotent,
+		})
+		if err != nil {
+			return Execution{}, execution.Run{}, fmt.Errorf("enqueue durable task execution: %w", err)
+		}
 	}
 	poll := time.NewTicker(100 * time.Millisecond)
 	defer poll.Stop()

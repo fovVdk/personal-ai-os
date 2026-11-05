@@ -37,6 +37,7 @@ func (MockGenerator) GenerateContext(ctx context.Context, goal GoalInput) (Plan,
 		for _, criterion := range goal.Criteria {
 			// The deterministic planner assigns the acceptance contract to its
 			// requirements checkpoint; this is a planning mapping, not evidence.
+			// 中文：确定性 Planner 将验收契约映射到 requirements 阶段；这只是计划映射，并非完成证据。
 			index := 0
 			if criterion.Type == goaldomain.CriterionArtifactExists || criterion.Type == goaldomain.CriterionMarkdownStructure {
 				index = len(plan.Tasks) - 1

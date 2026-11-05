@@ -1,6 +1,5 @@
 // English: These handlers bind human decisions to persisted, parameter-hashed approval requests.
 // 中文：这些处理器将人工决策绑定到持久化且按参数哈希约束的审批请求。
-// 中文：这些处理器将人工决策绑定到已持久化且参数哈希固定的审批请求。
 package api
 
 import (

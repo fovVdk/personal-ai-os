@@ -131,6 +131,7 @@ func (r sourceRepository) AddReference(ctx context.Context, item source.Referenc
 		return source.Reference{}, paierrors.ErrNotFound
 	}
 	// Citation URLs must be exactly bound to this immutable snapshot.
+	// 中文：引用 URL 必须精确绑定到这个不可变来源快照。
 	if item.CitationURL != originalURL && item.CitationURL != finalURL {
 		return source.Reference{}, errors.New("citation URL does not match source snapshot")
 	}

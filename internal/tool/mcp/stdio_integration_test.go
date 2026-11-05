@@ -22,6 +22,7 @@ import (
 const stdioFixtureEnv = "PAIOS_MCP_STDIO_FIXTURE"
 
 // TestMCPStdioServerProcess is both a test-only child-process entry point and a normal no-op test.
+// 中文：TestMCPStdioServerProcess 既是仅供测试使用的子进程入口，也是普通运行时的空操作测试。
 func TestMCPStdioServerProcess(t *testing.T) {
 	if os.Getenv(stdioFixtureEnv) != "1" {
 		return
@@ -44,6 +45,7 @@ func TestMCPStdioServerProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	// Avoid testing.T's PASS output on stdout; the stdio stream is the MCP wire protocol.
+	// 中文：避免 testing.T 将 PASS 输出写入 stdout，因为 stdio 流本身承载 MCP 线协议。
 	os.Exit(0)
 }
 

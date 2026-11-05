@@ -18,6 +18,7 @@ const FetcherVersion = "paios-safe-fetch/v1"
 var ErrNotFound = errors.New("source snapshot not found")
 
 // Snapshot is an immutable capture. RawContent and normalized content are retained for audit/reverification.
+// 中文：Snapshot 是不可变来源采集记录；原始内容和规范化内容均保留，以便审计与重新验证。
 type Snapshot struct {
 	ID                string            `json:"source_id"`
 	OwnerID           string            `json:"owner_id"`
@@ -74,9 +75,6 @@ func validateURL(raw string) error {
 	if err != nil || parsed.Hostname() == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return errors.New("URL must be absolute HTTP(S) without credentials")
 	}
-	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
-		return errors.New("URL port is not allowed")
-	}
 	if strings.ContainsAny(raw, "\r\n\x00") {
 		return errors.New("URL contains invalid characters")
 	}
@@ -125,6 +123,7 @@ type Repository interface {
 }
 
 // Verifier checks structural and lexical linkage only. It never asserts semantic support.
+// 中文：Verifier 仅检查结构和词面关联；绝不声称来源在语义上支持报告陈述。
 type Verifier struct {
 	Repository Repository
 	MaxAge     time.Duration

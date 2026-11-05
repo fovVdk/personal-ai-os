@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type Config struct {
 	OllamaBaseURL         string
 	DataDir               string
 	FileStorageDir        string
+	ReportExportDir       string
 	HTTPFetchAllowedHosts []string
 	// MCPServers are operator-provided definitions; empty disables MCP connections.
 	// 中文：MCPServers 由运维配置；为空时不连接 MCP Server。
@@ -80,6 +82,7 @@ func Load() (Config, error) {
 		OllamaBaseURL:         env("OLLAMA_BASE_URL", "http://localhost:11434"),
 		DataDir:               env("DATA_DIR", "./data"),
 		FileStorageDir:        env("FILE_STORAGE_DIR", "./data/files"),
+		ReportExportDir:       os.Getenv("REPORT_EXPORT_DIR"),
 		HTTPFetchAllowedHosts: csvEnv("HTTP_FETCH_ALLOWED_HOSTS"),
 		MCPServers:            mcpServers,
 		MaxAgentSteps:         intEnv("MAX_AGENT_STEPS", 12),
@@ -108,6 +111,64 @@ func Load() (Config, error) {
 	}
 	if strings.TrimSpace(cfg.Host) == "" || strings.TrimSpace(cfg.Host) != cfg.Host {
 		return Config{}, errors.New("APP_HOST must not be empty")
+	}
+	if cfg.ReportExportDir != "" {
+		if strings.TrimSpace(cfg.ReportExportDir) != cfg.ReportExportDir || strings.ContainsAny(cfg.ReportExportDir, "\x00\r\n") {
+			return Config{}, errors.New("REPORT_EXPORT_DIR must be a clean local path")
+		}
+		if strings.TrimSpace(cfg.FileStorageDir) == "" {
+			return Config{}, errors.New("FILE_STORAGE_DIR is required when REPORT_EXPORT_DIR is configured")
+		}
+		storageRoot, storageErr := filepath.Abs(cfg.FileStorageDir)
+		exportRoot, exportErr := filepath.Abs(cfg.ReportExportDir)
+		if storageErr != nil || exportErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR must be distinct from FILE_STORAGE_DIR and both roots must resolve")
+		}
+		storageRelative, relErr := filepath.Rel(storageRoot, exportRoot)
+		if relErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR roots could not be compared safely")
+		}
+		exportRelative, relErr := filepath.Rel(exportRoot, storageRoot)
+		if relErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR roots could not be compared safely")
+		}
+		if storageRelative == "." || exportRelative == "." || (!filepath.IsAbs(storageRelative) && storageRelative != ".." && !strings.HasPrefix(storageRelative, ".."+string(filepath.Separator))) || (!filepath.IsAbs(exportRelative) && exportRelative != ".." && !strings.HasPrefix(exportRelative, ".."+string(filepath.Separator))) {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR must not contain one another")
+		}
+		storageResolved, storageResolveErr := resolveConfiguredRoot(cfg.FileStorageDir)
+		exportResolved, exportResolveErr := resolveConfiguredRoot(cfg.ReportExportDir)
+		if storageResolveErr != nil || exportResolveErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR roots could not be resolved safely")
+		}
+		storageResolvedRelative, relErr := filepath.Rel(storageResolved, exportResolved)
+		if relErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR roots could not be compared safely")
+		}
+		exportResolvedRelative, relErr := filepath.Rel(exportResolved, storageResolved)
+		if relErr != nil {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR roots could not be compared safely")
+		}
+		if storageResolvedRelative == "." || exportResolvedRelative == "." || (!filepath.IsAbs(storageResolvedRelative) && storageResolvedRelative != ".." && !strings.HasPrefix(storageResolvedRelative, ".."+string(filepath.Separator))) || (!filepath.IsAbs(exportResolvedRelative) && exportResolvedRelative != ".." && !strings.HasPrefix(exportResolvedRelative, ".."+string(filepath.Separator))) {
+			return Config{}, errors.New("REPORT_EXPORT_DIR and FILE_STORAGE_DIR resolve to overlapping directories")
+		}
+	}
+	if liveURL := strings.TrimSpace(os.Getenv("PAIOS_LIVE_SOURCE_URL")); liveURL != "" {
+		parsed, err := url.ParseRequestURI(liveURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+			return Config{}, errors.New("PAIOS_LIVE_SOURCE_URL must be an absolute credential-free HTTPS URL")
+		}
+		allowed := map[string]bool{}
+		for _, host := range csvEnv("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS") {
+			if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "/:@*\\\r\n\x00") || strings.HasSuffix(host, ".") {
+				return Config{}, fmt.Errorf("invalid PAIOS_LIVE_SOURCE_ALLOWED_HOSTS entry %q", host)
+			}
+			allowed[strings.ToLower(host)] = true
+		}
+		if !allowed[strings.ToLower(parsed.Hostname())] {
+			return Config{}, errors.New("PAIOS_LIVE_SOURCE_URL host must appear exactly in PAIOS_LIVE_SOURCE_ALLOWED_HOSTS")
+		}
+	} else if strings.TrimSpace(os.Getenv("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS")) != "" {
+		return Config{}, errors.New("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS requires PAIOS_LIVE_SOURCE_URL")
 	}
 	if strings.Contains(cfg.Host, ":") && net.ParseIP(cfg.Host) == nil {
 		return Config{}, errors.New("APP_HOST must be a hostname or IP address without a port")
@@ -202,6 +263,43 @@ func Load() (Config, error) {
 		seenMCPIDs[server.ID] = true
 	}
 	return cfg, nil
+}
+
+func resolveConfiguredRoot(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Abs(resolved)
+	}
+	// Canonicalize through the nearest existing parent so aliases are detected
+	// even when the final directory has not been created yet.
+	// 中文：从最近存在的父目录开始规范化，确保最终目录尚未创建时也能识别路径别名。
+	missing := make([]string, 0)
+	parent := abs
+	for {
+		if _, statErr := os.Lstat(parent); statErr == nil {
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		base := filepath.Base(parent)
+		if base == "." || base == string(filepath.Separator) {
+			return "", err
+		}
+		missing = append(missing, base)
+		parent = filepath.Dir(parent)
+	}
+	canonicalParent, parentErr := filepath.EvalSymlinks(parent)
+	if parentErr != nil {
+		return "", parentErr
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		canonicalParent = filepath.Join(canonicalParent, missing[i])
+	}
+	return filepath.Clean(canonicalParent), nil
 }
 
 func env(key, fallback string) string {

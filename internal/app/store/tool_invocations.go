@@ -104,6 +104,7 @@ func (p *Postgres) Verify(ctx context.Context, request gateway.Request) error {
 }
 
 // ResumeApproval requeues a waiting durable run only when its exact context-bound approval remains valid.
+// 中文：仅当精确上下文绑定的审批仍有效时，ResumeApproval 才会重新排队等待中的持久化执行。
 func (p *Postgres) ResumeApproval(ctx context.Context, userID, approvalID string) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -140,6 +141,7 @@ func (p *Postgres) ResumeApproval(ctx context.Context, userID, approvalID string
 	}
 	if runStatus == "running" {
 		// The Worker is still unwinding the approval-required Agent call; Fail() will queue it if approval is already granted.
+		// 中文：Worker 仍在结束需要审批的 Agent 调用；如果审批已通过，Fail() 会负责重新排队。
 		return tx.Commit(ctx)
 	}
 	if runStatus == "queued" {

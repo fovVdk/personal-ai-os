@@ -92,6 +92,7 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	waitForChildMarker(t, ctx, childLines, "WORKER_CHECKPOINT_READY "+rootRun.ID)
 
 	// A second independent Worker Pool is active while the first process owns the unexpired lease.
+	// 中文：第一个进程持有未过期租约时，第二个独立 Worker Pool 已启动并竞争认领。
 	durable := store.NewDurableExecutionStore(pool)
 	claimSignals := make(chan string, 128)
 	observedRepository := &claimObservingRepository{Repository: durable, claims: claimSignals}
@@ -166,6 +167,7 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	}
 
 	// Schedule each successor only after its predecessor completed with persisted Evidence.
+	// 中文：仅当前置任务及其 Evidence 持久化完成后，才调度下一个依赖任务。
 	for i := 1; i < len(createdTasks)-1; i++ {
 		previous, err := tasks.Get(ctx, createdTasks[i-1].ID)
 		if err != nil || previous.Status != task.Completed {
@@ -233,6 +235,7 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	}
 
 	// Restart the actual Core with one dependency-ready Task. Its Mock Agent must safely refuse false success.
+	// 中文：重启真实 Core 并保留一个依赖已满足的 Task；Mock Agent 必须安全拒绝伪造成功。
 	core := startCoreService(t, ctx, os.Getenv("PAIOS_TEST_DATABASE_URL"))
 	var coreTasks struct {
 		Items []task.Task `json:"items"`
@@ -294,6 +297,7 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	core.stop(t)
 
 	// The failed unverified attempt is explicitly retryable by a later trusted Worker after Core restart.
+	// 中文：未验证的失败尝试在 Core 重启后由后续可信 Worker 显式重试。
 	lastTask, err = tasks.Transition(ctx, lastTask.ID, task.Retrying)
 	if err != nil {
 		t.Fatalf("schedule verified Worker retry after Core restart: %v", err)
@@ -342,6 +346,7 @@ func TestDurableWorkerCrashAndCheckpointRecoveryAcceptance(t *testing.T) {
 	assertZero(t, ctx, pool, "SELECT count(*) FROM goal_evidence WHERE goal_id=$1", goalItem.ID)
 
 	// Restart Core again after all Tasks settle and verify every persisted execution via the HTTP API.
+	// 中文：全部 Task 结束后再次重启 Core，通过 HTTP API 核对每个持久化 Execution。
 	core = startCoreService(t, ctx, os.Getenv("PAIOS_TEST_DATABASE_URL"))
 	defer core.stop(t)
 	core.request(t, http.MethodGet, "/api/v1/tasks?goal_id="+goalItem.ID, nil, http.StatusOK, &coreTasks)

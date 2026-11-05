@@ -177,3 +177,51 @@ func TestGatewayPassesOnlyValidatedInvocationIdentityToContextualHandler(t *test
 		t.Fatalf("trusted invocation context=%+v, want %+v", handler.received, want)
 	}
 }
+
+func TestGatewayRequiresPersistedApprovalBeforeContextualExternalExport(t *testing.T) {
+	store := &testStore{reservation: Reservation{InvocationID: "export-inv", Status: "running"}}
+	gateway, _ := buildGateway(t, policy.RequireApproval, store, nil, nil)
+	request := validRequest()
+	result, err := gateway.Execute(context.Background(), request)
+	if err != nil || result.Status != "waiting_approval" || store.pending != 1 || store.begins != 0 {
+		t.Fatalf("unapproved export result=%+v err=%v approval_requests=%d begins=%d", result, err, store.pending, store.begins)
+	}
+	store.approvalStatus = "approved"
+	calls := 0
+	approvedHandler := &countingContextualHandler{calls: &calls}
+	identity := registry.Identity{ProviderID: "builtin", ToolID: "test.external", Version: "v1"}
+	definition := registry.Definition{
+		Identity: identity, Name: "test external export", Source: registry.SourceBuiltin,
+		Kind: registry.KindExternal, RiskLevel: 2, Idempotency: registry.IdempotencyNone,
+		Timeout: time.Second, MaxInputBytes: 4096, MaxOutputBytes: 4096, ExecutionEnvironment: "local",
+		InputSchema:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`),
+		OutputSchema: json.RawMessage(`{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}`),
+	}
+	tools := registry.New()
+	if err := tools.Register(definition, approvedHandler); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Registry = tools
+	request.Identity = identity
+	result, err = gateway.Execute(context.Background(), request)
+	if err != nil || result.Status != "succeeded" || calls != 1 || store.begins != 1 {
+		t.Fatalf("approved exact export result=%+v err=%v calls=%d begins=%d", result, err, calls, store.begins)
+	}
+	if approvedHandler.received.GoalID != request.GoalID || approvedHandler.received.TaskID != request.TaskID || approvedHandler.received.ExecutionID != request.ExecutionID || approvedHandler.received.StepID != request.StepID {
+		t.Fatalf("approved export did not receive trusted invocation context: %+v", approvedHandler.received)
+	}
+}
+
+type countingContextualHandler struct {
+	calls    *int
+	received registry.InvocationContext
+}
+
+func (h *countingContextualHandler) Execute(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return nil, errors.New("contextual execution path was not used")
+}
+func (h *countingContextualHandler) ExecuteWithContext(_ context.Context, call registry.InvocationContext, _ json.RawMessage) (json.RawMessage, error) {
+	*h.calls++
+	h.received = call
+	return json.RawMessage(`{"value":"ok"}`), nil
+}

@@ -1,3 +1,5 @@
+// English: This file exposes owner-scoped HTTP handlers for immutable Source Snapshots and report citations.
+// 中文：本文件提供按所有者隔离的不可变来源快照及报告引用 HTTP 处理器。
 package api
 
 import (

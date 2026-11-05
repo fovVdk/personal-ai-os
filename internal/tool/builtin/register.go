@@ -17,9 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"personal-ai-os/internal/goal"
 	"personal-ai-os/internal/knowledge"
 	"personal-ai-os/internal/memory"
 	"personal-ai-os/internal/source"
+	"personal-ai-os/internal/task"
 	"personal-ai-os/internal/tool/registry"
 )
 
@@ -33,10 +35,13 @@ const (
 
 type Options struct {
 	FileRoot              string
+	ReportExportRoot      string
 	OwnerID               string
 	Memories              memory.Repository
 	Knowledge             knowledge.Repository
 	Sources               source.Repository
+	Goals                 goal.Repository
+	Tasks                 task.Repository
 	HTTPFetchAllowedHosts []string
 	Now                   func() time.Time
 }
@@ -67,6 +72,31 @@ func Register(tools *registry.Registry, options Options) error {
 		}
 		if err := register(tools, definition("filesystem.list", "List one directory beneath the configured root", `{"path":{"type":"string"}}`, []string{"path"}, "result", registry.KindReadOnly, 0), listHandler{root}); err != nil {
 			return err
+		}
+		if options.Goals != nil && options.Tasks != nil && options.OwnerID != "" {
+			writeDefinition := definition("artifact.write", "Atomically write a bounded artifact to a confirmed Goal criterion path", `{"criterion_id":{"type":"string"},"content":{"type":"string"}}`, []string{"criterion_id", "content"}, "result", registry.KindMutation, 1)
+			writeDefinition.MaxInputBytes = 1 << 20
+			if err := register(tools, writeDefinition, artifactWriter{root: root, goals: options.Goals, tasks: options.Tasks, owner: options.OwnerID}); err != nil {
+				return err
+			}
+		}
+		if strings.TrimSpace(options.ReportExportRoot) != "" {
+			exportRoot, err := newFileRoot(options.ReportExportRoot)
+			if err != nil {
+				return fmt.Errorf("configure report export root: %w", err)
+			}
+			if overlap, err := fileRootsOverlap(root.root, exportRoot.root); err != nil {
+				return fmt.Errorf("resolve report export/artifact roots: %w", err)
+			} else if overlap {
+				return errors.New("report export root must not equal, contain, or be contained by artifact root")
+			}
+			if options.Goals == nil || options.Tasks == nil || options.OwnerID == "" {
+				return errors.New("report export requires Goal, Task and owner repositories")
+			}
+			publishDefinition := definition("report.export", "Export an unchanged Goal report to the separately configured publication directory; requires exact human approval", `{"criterion_id":{"type":"string"},"criterion_version":{"type":"integer"},"artifact_path":{"type":"string"},"sha256":{"type":"string"}}`, []string{"criterion_id", "criterion_version", "artifact_path", "sha256"}, "result", registry.KindExternal, 2)
+			if err := register(tools, publishDefinition, reportExporter{reader: artifactWriter{root: root, goals: options.Goals, tasks: options.Tasks, owner: options.OwnerID}, export: exportRoot, maxSize: maxArtifactToolBytes}); err != nil {
+				return err
+			}
 		}
 	}
 	if options.Memories != nil {
@@ -109,9 +139,29 @@ func Register(tools *registry.Registry, options Options) error {
 			if err := register(tools, definition("source.capture", "Fetch an allowlisted public source and persist an immutable snapshot", `{"url":{"type":"string"}}`, []string{"url"}, "result", registry.KindMutation, 1), capture); err != nil {
 				return err
 			}
+			if options.Goals == nil || options.Tasks == nil {
+				return errors.New("source reference Tool requires Goal and Task repositories")
+			}
+			if err := register(tools, definition("source.reference.add", "Bind an exact quote from a persisted snapshot to a confirmed report criterion", `{"criterion_id":{"type":"string"},"source_id":{"type":"string"},"url":{"type":"string"},"quote":{"type":"string"}}`, []string{"criterion_id", "source_id", "url", "quote"}, "result", registry.KindMutation, 1), sourceReferenceTool{goals: options.Goals, tasks: options.Tasks, repository: options.Sources, owner: options.OwnerID}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func fileRootsOverlap(left, right string) (bool, error) {
+	if left == right || strings.HasPrefix(left, right+string(filepath.Separator)) || strings.HasPrefix(right, left+string(filepath.Separator)) {
+		return true, nil
+	}
+	resolvedLeft, leftErr := filepath.EvalSymlinks(left)
+	resolvedRight, rightErr := filepath.EvalSymlinks(right)
+	if leftErr != nil || rightErr != nil {
+		return false, errors.Join(leftErr, rightErr)
+	}
+	resolvedLeft, _ = filepath.Abs(resolvedLeft)
+	resolvedRight, _ = filepath.Abs(resolvedRight)
+	return resolvedLeft == resolvedRight || strings.HasPrefix(resolvedLeft, resolvedRight+string(filepath.Separator)) || strings.HasPrefix(resolvedRight, resolvedLeft+string(filepath.Separator)), nil
 }
 
 type sourceCapture struct {

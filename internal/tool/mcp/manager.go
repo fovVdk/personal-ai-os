@@ -29,6 +29,7 @@ import (
 )
 
 // TransportKind selects one explicitly configured MCP transport.
+// 中文：TransportKind 表示运维显式配置的 MCP 传输方式。
 type TransportKind string
 
 const (
@@ -37,6 +38,7 @@ const (
 )
 
 // ServerConfig is operator-owned and is never populated from Agent or model input.
+// 中文：ServerConfig 只由运维配置，不能由 Agent 或模型输入生成。
 type ServerConfig struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
@@ -52,6 +54,7 @@ type ServerConfig struct {
 }
 
 // Options bounds all network, discovery, and tool-call work.
+// 中文：Options 为网络连接、Tool 发现和调用设定资源上限。
 type Options struct {
 	ConnectTimeout time.Duration
 	CallTimeout    time.Duration
@@ -1119,5 +1122,6 @@ func publicMCPAddress(ip net.IP, allowLoopback bool) bool {
 }
 
 // Ensure the only runtime implementation is the official SDK transport and client.
+// 中文：编译期确保运行时只使用官方 SDK 提供的传输与客户端实现。
 var _ sdk.Transport = (*sdk.StreamableClientTransport)(nil)
 var _ sdk.Transport = (*sdk.CommandTransport)(nil)

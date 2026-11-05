@@ -1,3 +1,5 @@
+// English: This file implements bounded HTTP(S) retrieval with exact host allowlists, public-IP pinning, and redirect checks.
+// 中文：本文件实现带精确主机白名单、公网 IP 固定及重定向复核的有界 HTTP(S) 来源采集。
 package source
 
 import (
@@ -23,7 +25,9 @@ type Fetcher struct {
 	allowed  map[string]struct{}
 	client   *http.Client
 	now      func() time.Time
-	resolver *net.Resolver
+	resolver interface {
+		LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+	}
 }
 
 func NewFetcher(allowedHosts []string) (*Fetcher, error) {

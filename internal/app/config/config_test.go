@@ -4,13 +4,15 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"APP_ENV", "APP_HOST", "APP_PORT", "DATABASE_URL", "LOG_LEVEL", "PAIOS_API_KEY", "MODEL_PROVIDER", "MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME", "OLLAMA_BASE_URL", "DATA_DIR", "FILE_STORAGE_DIR", "HTTP_FETCH_ALLOWED_HOSTS", "MCP_SERVERS_JSON", "MAX_AGENT_STEPS", "MAX_MODEL_CALLS", "MAX_TOOL_CALLS", "MAX_MODEL_TOKENS", "MAX_EXECUTION_SECONDS", "MAX_EXECUTION_COST", "MAX_RETRIES", "PAIOS_WORKER_ID", "PAIOS_WORKER_COUNT", "PAIOS_WORKER_LEASE_SECONDS", "PAIOS_WORKER_HEARTBEAT_SECONDS", "PAIOS_WORKER_POLL_MILLISECONDS", "PAIOS_WORKER_RECOVERY_SECONDS", "SHUTDOWN_GRACE_SECONDS"} {
+	for _, key := range []string{"APP_ENV", "APP_HOST", "APP_PORT", "DATABASE_URL", "LOG_LEVEL", "PAIOS_API_KEY", "MODEL_PROVIDER", "MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME", "OLLAMA_BASE_URL", "DATA_DIR", "FILE_STORAGE_DIR", "REPORT_EXPORT_DIR", "HTTP_FETCH_ALLOWED_HOSTS", "PAIOS_LIVE_SOURCE_URL", "PAIOS_LIVE_SOURCE_ALLOWED_HOSTS", "MCP_SERVERS_JSON", "MAX_AGENT_STEPS", "MAX_MODEL_CALLS", "MAX_TOOL_CALLS", "MAX_MODEL_TOKENS", "MAX_EXECUTION_SECONDS", "MAX_EXECUTION_COST", "MAX_RETRIES", "PAIOS_WORKER_ID", "PAIOS_WORKER_COUNT", "PAIOS_WORKER_LEASE_SECONDS", "PAIOS_WORKER_HEARTBEAT_SECONDS", "PAIOS_WORKER_POLL_MILLISECONDS", "PAIOS_WORKER_RECOVERY_SECONDS", "SHUTDOWN_GRACE_SECONDS"} {
 		t.Setenv(key, "")
 	}
 }
@@ -60,6 +62,57 @@ func TestLoadHTTPFetchHostAllowlist(t *testing.T) {
 	t.Setenv("HTTP_FETCH_ALLOWED_HOSTS", "*.example.com")
 	if _, err := Load(); err == nil {
 		t.Fatal("wildcard host allowlist must be rejected")
+	}
+}
+
+func TestLoadReportExportRootMustBeSeparate(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("FILE_STORAGE_DIR", "/tmp/paios-artifacts")
+	t.Setenv("REPORT_EXPORT_DIR", "/tmp/paios-published")
+	if _, err := Load(); err != nil {
+		t.Fatalf("distinct export root rejected: %v", err)
+	}
+	clearConfigEnv(t)
+	t.Setenv("FILE_STORAGE_DIR", "/tmp/paios-data")
+	t.Setenv("REPORT_EXPORT_DIR", "/tmp/paios-data/published")
+	if _, err := Load(); err == nil {
+		t.Fatal("nested export root should be rejected")
+	}
+	clearConfigEnv(t)
+	parent := t.TempDir()
+	storage := filepath.Join(parent, "files")
+	alias := filepath.Join(parent, "export-alias")
+	if err := os.Mkdir(storage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(storage, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FILE_STORAGE_DIR", storage)
+	t.Setenv("REPORT_EXPORT_DIR", alias)
+	if _, err := Load(); err == nil {
+		t.Fatal("symlink alias of FILE_STORAGE_DIR should be rejected as export root")
+	}
+}
+
+func TestLoadLiveSourceAcceptanceRequiresExactHTTPSAllowlist(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("PAIOS_LIVE_SOURCE_URL", "https://research.example/project")
+	t.Setenv("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS", "research.example")
+	if _, err := Load(); err != nil {
+		t.Fatalf("valid explicit HTTPS source configuration rejected: %v", err)
+	}
+	clearConfigEnv(t)
+	t.Setenv("PAIOS_LIVE_SOURCE_URL", "https://research.example/project")
+	t.Setenv("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS", "other.example")
+	if _, err := Load(); err == nil {
+		t.Fatal("live source host outside exact allowlist accepted")
+	}
+	clearConfigEnv(t)
+	t.Setenv("PAIOS_LIVE_SOURCE_URL", "http://research.example/project")
+	t.Setenv("PAIOS_LIVE_SOURCE_ALLOWED_HOSTS", "research.example")
+	if _, err := Load(); err == nil {
+		t.Fatal("non-HTTPS live source URL accepted")
 	}
 }
 

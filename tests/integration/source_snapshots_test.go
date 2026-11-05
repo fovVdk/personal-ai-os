@@ -1,3 +1,5 @@
+// English: This PostgreSQL acceptance verifies immutable Source Snapshot persistence and exact report citation linkage.
+// 中文：本 PostgreSQL 验收验证不可变来源快照持久化及报告引用的精确绑定。
 package integration
 
 import (

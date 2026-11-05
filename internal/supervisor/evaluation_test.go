@@ -97,6 +97,7 @@ func TestEvaluateGoalSnapshotVerifiesTypedEvidenceCriteria(t *testing.T) {
 	}
 
 	// Duplicated representations of the same persisted Evidence UUID only count once.
+	// 中文：同一持久化 Evidence UUID 的重复表示只能计数一次。
 	runs[0].Evidence = append(runs[0].Evidence, runs[0].Evidence[0])
 	duplicate := EvaluateGoalSnapshot(item, tasks, runs, UsageTotals{}, Budgets{}, time.Now())
 	if len(duplicate.CompletedCriteria) != 1 || len(duplicate.CompletedCriteria[0].Evidence) != 2 {

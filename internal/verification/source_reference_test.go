@@ -1,3 +1,5 @@
+// English: These tests verify report artifacts against persisted source snapshots without claiming semantic entailment.
+// 中文：本测试验证报告产物与持久化来源快照的关联，但不声称完成语义蕴含判断。
 package verification
 
 import (

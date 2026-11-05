@@ -446,6 +446,7 @@ func (s *DurableExecutionStore) Fail(ctx context.Context, lease execution.Lease,
 	if !cancellationRequested && class == execution.FailureUncertain {
 		if retrySafe && idempotent && attempts < maxAttempts {
 			// Only an explicit idempotency guarantee allows replay after an uncertain outcome.
+			// 中文：只有明确声明幂等保证时，结果不确定后才允许重放。
 			next, taskStatus, class = execution.StatusRetryWait, "retrying", execution.FailureSafeResume
 		} else {
 			next, taskStatus = execution.StatusUnknown, "waiting_external"
@@ -663,6 +664,7 @@ func (s *DurableExecutionStore) RecoverExpired(ctx context.Context, limit int, r
 			next, taskStatus, reason, class = execution.StatusRetryWait, "retrying", "lease expired before executor start; no side effect occurred", execution.FailureSafeRetry
 		} else if item.retrySafe && item.idempotent && item.status == execution.StatusRunning && item.attempt < item.max {
 			// A running operation may have completed an external side effect before lease loss; retry only when its input declares a strong idempotency guarantee.
+			// 中文：租约丢失前运行中的操作可能已产生外部副作用；只有输入明确声明强幂等保证时才重试。
 			next, taskStatus, reason, class = execution.StatusRetryWait, "retrying", "lease expired during an explicitly idempotent execution", execution.FailureSafeResume
 		}
 		if _, err := tx.Exec(ctx, `UPDATE execution_runs SET status=$2,worker_id=NULL,lease_until=NULL,heartbeat_at=now(),available_at=CASE WHEN $2='retry_wait' THEN now()+$3::interval ELSE available_at END,
@@ -757,6 +759,26 @@ func (s *DurableExecutionStore) Get(ctx context.Context, id string) (execution.R
 		return execution.Run{}, fmt.Errorf("get durable execution: %w", err)
 	}
 	return run, nil
+}
+
+// ActiveForTask returns the newest persisted non-terminal execution for the Task.
+// It is used to continue an approved/recovered run rather than creating a parallel attempt.
+// 中文：ActiveForTask 返回该 Task 最新的非终态持久化 Execution，用于继续审批/恢复中的执行，避免创建并行尝试。
+func (s *DurableExecutionStore) ActiveForTask(ctx context.Context, taskID string) (execution.Run, bool, error) {
+	run, err := scanDurableRun(s.pool.QueryRow(ctx, `SELECT e.id::text,e.task_id::text,t.goal_id::text,e.agent_id,e.worker_id,
+		i.scope,i.idempotency_key,i.input_hash,e.payload,e.result,e.status,e.attempt,e.max_attempts,e.fencing_token,
+		COALESCE(e.lease_until,'epoch'::timestamptz),COALESCE(e.heartbeat_at,'epoch'::timestamptz),e.available_at,
+		e.retry_safe,e.idempotent,e.cancellation_requested,e.error_class,e.failure_reason,e.state_reason,e.started_at,e.updated_at
+		FROM execution_runs e JOIN tasks t ON t.id=e.task_id LEFT JOIN execution_idempotency i ON i.execution_run_id=e.id
+		WHERE e.task_id=$1 AND e.status IN ('queued','claimed','running','waiting_approval','waiting_external','unknown')
+		ORDER BY e.started_at DESC NULLS LAST,e.updated_at DESC,e.id DESC LIMIT 1`, taskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return execution.Run{}, false, nil
+	}
+	if err != nil {
+		return execution.Run{}, false, fmt.Errorf("load active durable execution for Task: %w", err)
+	}
+	return run, true, nil
 }
 
 func (s *DurableExecutionStore) ResumeApproval(ctx context.Context, userID, approvalID string) error {

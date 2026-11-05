@@ -113,6 +113,7 @@ func (s *OutboxDispatcherStore) dispatchOne(ctx context.Context, workerID string
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Events wake explicitly-created jobs; they do not silently opt every
 			// Goal into autonomous execution.
+			// 中文：事件只唤醒用户显式创建的 Job，不会默默让所有 Goal 开始自主执行。
 		} else if err != nil {
 			return fmt.Errorf("record Goal Job wake receipt: %w", err)
 		} else {

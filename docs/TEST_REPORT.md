@@ -1,6 +1,6 @@
 # Test and Validation Report
 
-Date: 2026-11-04 (updated after Phase 12.2.3–12.2.5 foundations)
+Date: 2026-11-05 (updated after Phase 12.3 implementation work)
 
 ## Phase 12.3 final verification addendum
 
@@ -11,6 +11,21 @@ Date: 2026-11-04 (updated after Phase 12.2.3–12.2.5 foundations)
 - Docker Compose config and YAML parse for Compose, config template and OpenAPI: passed.
 - Hosted Go 1.25 CI: pending; local Go 1.27.3 results are not substituted for hosted CI.
 - Complete single-scenario Autonomous Research Goal E2E: NOT VERIFIED; see [Autonomous Goal E2E report](AUTONOMOUS_GOAL_E2E_REPORT.md).
+
+## Phase 12.3.4 work-in-progress addendum (2026-11-04)
+
+- Implemented after the baseline above: criterion-scoped atomic `artifact.write`, immutable `source.reference.add` Tool binding, and opt-in Risk-2 `report.export` with API Approval over exact criterion ID/version/path/SHA-256. A Goal Job-driven deterministic research E2E with API approval continuation and a separate real HTTP side-effect/Worker subprocess crash/fresh-Core unknown-recovery test are authored. Added `make test-autonomous-e2e` and retained opt-in `make test-source-live`.
+- Targeted offline tests passed with `GOPROXY=off`: `internal/source`, `internal/tool/builtin`, `internal/app/config`, and `internal/supervisor`.
+- Whole-repository and PostgreSQL E2E reruns are BLOCKED before compilation: module proxy requests for `github.com/jackc/pgx/v5` and `github.com/go-chi/chi/v5` timed out. The new integration tests are NOT VERIFIED; don't infer success from their source code.
+- `make test-source-live` without operator URL/allowlist correctly returned BLOCKED; no live source was fetched.
+- Full single-scenario Phase 12.3.4 closure (unknown effect + Worker takeover + Core restart + final research Goal completion) remains NOT VERIFIED; hosted Go 1.25 CI also pending.
+
+## Documentation and comment coverage addendum
+
+- Go source/test files were scanned: every file has a bilingual file/Package description and every Go line-comment block has a Chinese counterpart; compiler directives are explained by adjacent bilingual comments.
+- README now documents current design principles, control/execution planes, modules, lifecycle and evidence flow, migration strategy, setup/deployment, Tool/Approval boundaries, and explicit limitations.
+- Historical SQL migrations were intentionally not edited because their checksums are verified on startup; their English/Chinese purpose is listed in [Migration Catalog](MIGRATION_CATALOG.md).
+- `make fmt` and `git diff --check` passed. Targeted offline packages (`source`, `builtin`, `tool/gateway`, `config`, `supervisor`, `planner`, `verification`) passed. The full `make test` attempt was blocked during dependency setup by `proxy.golang.org` timeouts fetching Chi and pgx; no whole-repository test/build pass is claimed for the latest workspace.
 
 ## Environment
 

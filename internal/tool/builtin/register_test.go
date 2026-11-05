@@ -1,8 +1,11 @@
+// English: These tests cover native Tool registration, path security, and policy gating for report export.
+// 中文：本测试覆盖原生工具注册、文件路径安全以及报告导出的策略审批门控。
 package builtin
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"personal-ai-os/internal/goal"
+	"personal-ai-os/internal/policy"
 	"personal-ai-os/internal/source"
+	"personal-ai-os/internal/task"
 	"personal-ai-os/internal/tool/registry"
 )
 
@@ -125,6 +131,62 @@ func TestFilesystemToolsConstrainPathsAndSymlinks(t *testing.T) {
 	}
 }
 
+func TestArtifactAndApprovalToolsRegisterOnlyWithExplicitOperatorRoots(t *testing.T) {
+	root, exportRoot := t.TempDir(), t.TempDir()
+	goals := artifactGoalRepository{item: goal.Goal{ID: "goal", OwnerID: "owner"}}
+	tasks := artifactTaskRepository{item: task.Task{ID: "task", GoalID: "goal", Status: task.Running}}
+	withoutExport := registry.New()
+	if err := Register(withoutExport, Options{FileRoot: root, OwnerID: "owner", Goals: goals, Tasks: tasks}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutExport.Resolve(registry.Identity{ProviderID: providerID, ToolID: "artifact.write", Version: toolVersion}); err != nil {
+		t.Fatalf("restricted artifact writer not registered: %v", err)
+	}
+	if _, err := withoutExport.Resolve(registry.Identity{ProviderID: providerID, ToolID: "report.export", Version: toolVersion}); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("report export must remain disabled without an explicit export root: %v", err)
+	}
+
+	withExport := registry.New()
+	if err := Register(withExport, Options{FileRoot: root, ReportExportRoot: exportRoot, OwnerID: "owner", Goals: goals, Tasks: tasks}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := withExport.Get(registry.Identity{ProviderID: providerID, ToolID: "report.export", Version: toolVersion})
+	if err != nil || entry.Definition.Kind != registry.KindExternal || entry.Definition.RiskLevel != 2 {
+		t.Fatalf("report export definition=%+v err=%v", entry, err)
+	}
+	aliasParent := t.TempDir()
+	artifactAlias := filepath.Join(aliasParent, "artifact-alias")
+	if err := os.Symlink(root, artifactAlias); err != nil {
+		t.Fatal(err)
+	}
+	if err := Register(registry.New(), Options{FileRoot: root, ReportExportRoot: artifactAlias, OwnerID: "owner", Goals: goals, Tasks: tasks}); err == nil {
+		t.Fatal("symlink alias overlapping Artifact root was accepted as export root")
+	}
+	missingRootParent := filepath.Join(aliasParent, "not-created-yet")
+	if err := os.Mkdir(missingRootParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nestedExportParent := filepath.Join(missingRootParent, "export")
+	if err := os.Mkdir(nestedExportParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(root, filepath.Join(nestedExportParent, "artifact-alias")); err != nil {
+		t.Fatal(err)
+	}
+	missingArtifactAliasRoot := filepath.Join(nestedExportParent, "artifact-alias", "child")
+	if err := Register(registry.New(), Options{FileRoot: missingArtifactAliasRoot, ReportExportRoot: nestedExportParent, OwnerID: "owner", Goals: goals, Tasks: tasks}); err == nil {
+		t.Fatal("nested roots escaping through symlink alias were accepted")
+	}
+	decision, err := policy.Evaluate(policy.Request{ToolID: "paios.native/report.export", Action: "report.export", Level: policy.A2, RiskLevel: entry.Definition.RiskLevel, ToolAllowed: true, ApprovalRequired: true})
+	if err != nil || decision.Decision != policy.RequireApproval {
+		t.Fatalf("report export policy=%+v err=%v, want human approval", decision, err)
+	}
+	readDecision, err := policy.Evaluate(policy.Request{ToolID: "paios.native/source.capture", Action: "source.capture", Level: policy.A1, RiskLevel: 1, ToolAllowed: true})
+	if err != nil || readDecision.Decision != policy.Allow {
+		t.Fatalf("research source capture policy=%+v err=%v, want no forced Approval", readDecision, err)
+	}
+}
+
 func TestHTTPFetchRejectsPrivateAddressesAndRedirectTargets(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +196,7 @@ func TestHTTPFetchRejectsPrivateAddressesAndRedirectTargets(t *testing.T) {
 	}))
 	defer server.Close()
 	parsedHost := strings.TrimPrefix(strings.TrimPrefix(server.URL, "http://"), "https://")
-	allowed := map[string]struct{}{strings.Split(parsedHost, ":")[0]: {}}
+	allowed := map[string]struct{}{parsedHost: {}}
 	fetch, err := newHTTPFetch(allowed)
 	if err != nil {
 		t.Fatal(err)

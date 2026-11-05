@@ -1,3 +1,5 @@
+// English: This PostgreSQL acceptance verifies a paused Goal Job remains durable and owner-scoped across Core process restarts.
+// 中文：本 PostgreSQL 验收验证暂停的 Goal Job 在 Core 进程重启后仍持久存在且保持所有者隔离。
 package integration
 
 import (

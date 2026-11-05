@@ -14,7 +14,7 @@
 
 ### Verification
 
-- Unit tests cover URL allowlist/port/scheme, local/private/reserved IP blocks, MIME filtering, script removal from HTML normalization, quote/URL mismatch and semantic-verification boundary.
+- Unit tests cover URL allowlist/port/scheme, local/private/reserved IP blocks, actual DNS resolver pinning rejection for cloud-metadata IPs, deterministic controlled-transport success/hash/time, allowed and rejected redirects/redirect limit, timeout, MIME/body limits, script removal from HTML normalization, quote/URL mismatch and semantic-verification boundary. These source-package tests passed offline with `GOPROXY=off`.
 - PostgreSQL integration tests passed in the full isolated acceptance and cover migration rollback/retry, raw-content roundtrip, snapshot/reference CRUD, hash/freshness checks, fabricated URL/quote rejection and immutable update rejection.
 - Artifact verifier tests cover visible citation binding and failure when cited report content is removed.
 
@@ -23,3 +23,4 @@
 - Real external-source capture requires operator configuration and a reachable allowlisted public host; no external source fetch was performed as part of this coding session.
 - The current exact quote check is lexical/structural only. It does not prove that a report claim is logically entailed, that the source is authoritative or independent, or that fetched content is factually accurate.
 - Raw content is stored in PostgreSQL with a 2 MiB cap; large-scale/object-storage retention is future work.
+- `make test-source-live` is implemented as an explicit opt-in PostgreSQL target and validates exact HTTPS host allowlisting, final URL and hash, then persists a live snapshot/reference. It was invoked without operator URL/allowlist and returned `BLOCKED` as designed; no live source was fetched.

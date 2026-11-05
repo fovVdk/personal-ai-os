@@ -176,6 +176,7 @@ func TestPostgresSourceReferenceFreshnessRecheckedAtGoalCompletion(t *testing.T)
 	}
 	// Simulate a verifier that accepted the snapshot at its recorded retrieval
 	// instant, then exercise the independent DB-time completion gate later.
+	// 中文：模拟验证器在快照采集时点认可来源，再由数据库时钟独立检查最终完成门禁。
 	verifier.Now = func() time.Time { return retrievedAt.Add(time.Minute) }
 	result, err := verifier.Verify(ctx, agentruntime.Request{OwnerID: testOwnerID, GoalID: goalItem.ID, TaskID: item.ID, TaskCriterionIDs: item.CriterionIDs, GoalCriteria: goalItem.Criteria}, agentruntime.Result{})
 	if err != nil || !result.Verified || len(result.Evidence) != 2 {

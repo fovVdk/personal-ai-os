@@ -111,6 +111,7 @@ func (p *Postgres) Transition(ctx context.Context, ownerID, id string, next goal
 		}
 		// Completion evidence is derived from the persisted Evaluation, never from
 		// caller-supplied prose. The request's evidence field cannot satisfy criteria.
+		// 中文：完成证据必须从持久化 Evaluation 推导，不能使用调用方自然语言；请求中的 evidence 字段不能满足成功标准。
 		evidence = verifiedEvidence
 	}
 	if next == goal.Completed {
@@ -287,12 +288,11 @@ func (p *Postgres) hasPersistedVerificationHash(ctx context.Context, tx pgx.Tx, 
 	if criterion.RequireReference {
 		rows, err := tx.Query(ctx, `SELECT sr.snapshot_id::text,sr.citation_url,sr.quote,sr.quote_hash,
 			ss.original_url,ss.final_url,ss.http_status,ss.mime_type,ss.retrieved_at,ss.content_hash,ss.raw_content,ss.normalized_content,
-			COALESCE(ev.reference,''),COALESCE(ev.content_hash,''),COALESCE(ev.id::text,'')
-			FROM source_references sr JOIN source_snapshots ss ON ss.id=sr.snapshot_id
-			LEFT JOIN criterion_verification_evidence link ON link.verification_id=$1
-			LEFT JOIN execution_evidence ev ON ev.id=link.evidence_id AND ev.criterion_id=$2 AND ev.criterion_version=$3
+			EXISTS(SELECT 1 FROM criterion_verification_evidence link JOIN execution_evidence ev ON ev.id=link.evidence_id
+				WHERE link.verification_id=$1 AND ev.criterion_id=$2 AND ev.criterion_version=$3
 				AND ev.verifier_type='core.source-reference' AND ev.verifier_version='v1'
-				AND ev.reference='source://'||ss.id::text||'#sha256='||ss.content_hash AND ev.content_hash=ss.content_hash
+				AND ev.reference='source://'||ss.id::text||'#sha256='||ss.content_hash AND ev.content_hash=ss.content_hash)
+			FROM source_references sr JOIN source_snapshots ss ON ss.id=sr.snapshot_id
 			WHERE sr.owner_id=$4 AND sr.goal_id=$5 AND sr.artifact_path=$6
 			ORDER BY sr.id FOR SHARE OF sr,ss`, verificationID, criterion.ID, criterion.Version, ownerID, goalID, criterion.ArtifactPath)
 		if err != nil {
@@ -309,13 +309,13 @@ func (p *Postgres) hasPersistedVerificationHash(ctx context.Context, tx pgx.Tx, 
 			var snapshotHash string
 			var rawContent []byte
 			var normalizedContent string
-			var evidenceReference, evidenceHash, evidenceID string
-			if err := rows.Scan(&snapshotID, &citationURL, &quote, &quoteHash, &originalURL, &finalURL, &status, &mimeType, &retrievedAt, &snapshotHash, &rawContent, &normalizedContent, &evidenceReference, &evidenceHash, &evidenceID); err != nil {
+			var evidenceBound bool
+			if err := rows.Scan(&snapshotID, &citationURL, &quote, &quoteHash, &originalURL, &finalURL, &status, &mimeType, &retrievedAt, &snapshotHash, &rawContent, &normalizedContent, &evidenceBound); err != nil {
 				return fmt.Errorf("scan source reference at Goal completion: %w", err)
 			}
 			count++
-			if evidenceID == "" || evidenceReference != "source://"+snapshotID+"#sha256="+snapshotHash || evidenceHash != snapshotHash {
-				return errors.New("current verification does not bind every report source reference")
+			if !evidenceBound {
+				return fmt.Errorf("current verification does not bind source snapshot %s", snapshotID)
 			}
 			if citationURL != originalURL && citationURL != finalURL {
 				return errors.New("report source reference URL no longer matches its snapshot")

@@ -44,6 +44,7 @@ func TestPostgresOutboxDispatcherWakesExistingJobsIdempotently(t *testing.T) {
 
 	// A persisted Goal update is a real Outbox source. While running it must only
 	// coalesce a wake signal; it must not start a second Supervisor loop.
+	// 中文：持久化 Goal 更新是实际 Outbox 来源；Job 运行中只合并唤醒请求，不能启动第二个 Supervisor 循环。
 	goalItem.Description = "changed to generate a durable update event"
 	if _, err := repository.Update(ctx, testOwnerID, goalItem); err != nil {
 		t.Fatalf("update Goal: %v", err)
@@ -53,6 +54,7 @@ func TestPostgresOutboxDispatcherWakesExistingJobsIdempotently(t *testing.T) {
 		t.Fatalf("load Goal update event: %v", err)
 	}
 	// Simulate a Dispatcher crash after the durable claim but before consumer work.
+	// 中文：模拟 Dispatcher 持久认领事件后、执行消费者逻辑前发生崩溃。
 	if _, err := pool.Exec(ctx, "UPDATE event_outbox SET dispatch_owner='crashed-dispatcher',dispatch_lease_until=now()-interval '1 second' WHERE id=$1", eventID); err != nil {
 		t.Fatalf("prepare expired dispatch lease: %v", err)
 	}
@@ -68,6 +70,7 @@ func TestPostgresOutboxDispatcherWakesExistingJobsIdempotently(t *testing.T) {
 
 	// Simulate redelivery after a dispatcher crash between consumer processing
 	// and acknowledgement. The consumer receipt must make this harmless.
+	// 中文：模拟消费者处理后、确认事件前崩溃造成的重复投递；消费回执必须使重放无害。
 	if _, err := pool.Exec(ctx, "UPDATE event_outbox SET published_at=NULL,dispatch_owner='',dispatch_lease_until=NULL WHERE id=$1", eventID); err != nil {
 		t.Fatalf("reset event for redelivery: %v", err)
 	}
@@ -115,6 +118,7 @@ func TestPostgresOutboxDispatcherWakesExistingJobsIdempotently(t *testing.T) {
 
 	// A terminal Goal is re-read from PostgreSQL; an obsolete event cannot revive
 	// its cancelled Job.
+	// 中文：终态 Goal 必须从 PostgreSQL 重新读取；过期事件不能复活已取消的 Job。
 	if _, err := jobs.Cancel(ctx, testOwnerID, job.ID); err != nil {
 		t.Fatalf("cancel Goal Job: %v", err)
 	}

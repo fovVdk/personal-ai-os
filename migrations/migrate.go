@@ -16,6 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// English: Embed all versioned SQL migrations in the binary; the following compiler directive is required by Go.
+// 中文：将所有带版本的 SQL 迁移嵌入二进制；下一行是 Go 编译器要求的指令。
+//
 //go:embed *.sql
 var files embed.FS
 

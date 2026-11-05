@@ -24,10 +24,11 @@ model:
   ollama_base_url: http://localhost:11434
 
 storage:
-  # filesystem.read/list are registered only when this trusted directory already exists.
-  # 仅当此可信目录已经存在时，才注册 filesystem.read/list。
+  # Native file Tools and Core Artifact verification use this trusted directory.
+  # 原生文件 Tool 和 Core Artifact 验证使用此可信目录。
   data_dir: ./data
   file_storage_dir: ./data/files
+  report_export_dir: "" # Optional distinct directory; report.export requires approval
 
 tools:
   # Exact host allowlist; empty disables http.fetch. Wildcards are not supported.

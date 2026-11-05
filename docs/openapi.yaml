@@ -572,12 +572,14 @@ paths:
   /api/v1/tools:
     get:
       summary: List registered Tool metadata (registration does not grant permission)
+      description: Optional native Tools are configured by FILE_STORAGE_DIR, HTTP_FETCH_ALLOWED_HOSTS, and REPORT_EXPORT_DIR. `report.export` is a distinct external action; its exact criterion version, path, and SHA-256 parameters are sent through Tool Gateway and require a persisted human Approval.
       responses:
         '200':
           description: Tool metadata and operational state
   /api/v1/tools/{provider}/{tool}/{version}:
     get:
       summary: Get the exact registered Tool version and schema
+      description: Tool metadata only. In particular, discoverable `report.export` still cannot execute without Core authorization, a live Execution lease, and exact parameter-bound human Approval.
       parameters:
         - name: provider
           in: path
